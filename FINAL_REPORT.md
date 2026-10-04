@@ -47,6 +47,8 @@ Prueba real futura preparada: `artifacts/real-validation-runner/RealValidation.e
 
 ## Conclusión
 
+Comprobación final de autenticación: a las 19:52:40 CEST se abrió la ventana `O2 Cloud - Login` del runner login-only, PID 10680, respondiendo, con perfil nuevo. Registro: `artifacts/real-validation-runner/runs/20261004-195240-3075790f51cd41c99ca06a5b046fe815/real-validation.log`. Tiempo máximo 90 s; no montaje ni escritura remota habilitados. No se ha completado una validación de archivos O2 reales en esta tarea.
+
 CORRECCIÓN IMPLEMENTADA Y VALIDADA OFFLINE; FALTA PRUEBA CONTRA O2 REAL
 
 TODO EL TRABAJO OFFLINE COMPLETADO; FALTA LOGIN HUMANO PARA VALIDACIÓN REAL
