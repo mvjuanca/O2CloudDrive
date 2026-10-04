@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Net;
 using Fsp;
 using O2CloudDrive.Api;
 using O2CloudDrive.Auth;
@@ -11,56 +12,146 @@ internal static class Program
     [STAThread]
     static int Main(string[] args)
     {
-        if (!args.Contains("--validate") && !args.Contains("--login-only"))
+        if (!args.Contains("--validate") && !args.Contains("--login-only") && !args.Contains("--api-read-probe"))
         {
-            Console.WriteLine("Use --login-only for fresh human login, or --validate for the scoped real test after login.");
+            Console.WriteLine("Use --api-read-probe for authenticated read-only diagnostics, or --validate for the scoped real test after explicit approval.");
             return 0;
         }
         // No Credential Manager, environment credentials, old profiles, app config, shell registration or updates.
         var work = Path.Combine(AppContext.BaseDirectory, "runs", DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
+        var logGate = new object();
         void Log(string text)
         {
             var line = DateTimeOffset.Now.ToString("O") + " " + text;
-            File.AppendAllText(Path.Combine(work, "real-validation.log"), line + Environment.NewLine);
-            Console.WriteLine(line);
+            lock (logGate)
+            {
+                File.AppendAllText(Path.Combine(work, "real-validation.log"), line + Environment.NewLine);
+                Console.WriteLine(line);
+            }
         }
+        O2Session? currentSessionForTrace = null;
+        var diagnosticPhase = "auth-flow-validator";
+        var cookieContainer = new CookieContainer();
+        var socketsHandler = new SocketsHttpHandler
+        {
+            ConnectTimeout = TimeSpan.FromSeconds(30),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+            AllowAutoRedirect = true,
+            AutomaticDecompression = DecompressionMethods.None,
+            UseCookies = true,
+            CookieContainer = cookieContainer,
+            UseProxy = true,
+        };
+        var traceHandler = new SafeHttpTraceHandler(Log, () => diagnosticPhase, () => currentSessionForTrace, cookieContainer)
+        {
+            InnerHandler = socketsHandler,
+        };
         try
         {
             Application.EnableVisualStyles();
-            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            using var http = new HttpClient(traceHandler) { Timeout = TimeSpan.FromMinutes(5) };
+            Log("HTTP_CLIENT timeout=300s_diagnostic_only; production_timeout=infinite; connect_timeout=30s; auto_redirect=true; " +
+                "decompression=none; cookies=true; system_proxy=true; tls_custom_validation=false; one_shared_http_client=true");
             var validator = new O2SessionValidator(http, "https://cloud.o2online.es/sapi/");
-            var profile = Path.Combine(Path.GetTempPath(), "O2CloudDrive-login-test2-" + Guid.NewGuid().ToString("N"));
-            O2Session? session;
-            using (var form = new O2LoginForm(new Uri("https://cloud.o2online.es/"), validator, profile, Log))
+            var profile = Path.Combine(Path.GetTempPath(), "O2CloudDrive-api-read-test3-" + Guid.NewGuid().ToString("N"));
+            try
             {
-                form.Shown += (_, _) => Log("HUMAN_LOGIN_WINDOW_OPEN; isolated temporary WebView2 profile; no Credential Manager or old profile read; no timeout");
-                form.ShowDialog();
-                session = form.CapturedSession;
-            }
+                O2Session? session;
+                using (var form = new O2LoginForm(new Uri("https://cloud.o2online.es/"), validator, profile, Log))
+                {
+                    form.Shown += (_, _) => Log("HUMAN_LOGIN_WINDOW_OPEN; test3 isolated temporary WebView2 profile; no Credential Manager or old profile read; no login timeout");
+                    form.ShowDialog();
+                    session = form.CapturedSession;
+                }
 
-            if (!TryDeleteProfile(profile))
-            {
-                Log("BLOCKED: temporary WebView2 profile could not be removed; stopped before API validation to avoid retaining browser session data");
-                return 3;
-            }
-            Log("TEMP_WEBVIEW_PROFILE_REMOVED; cookies/storage not retained on disk");
+                if (session is not { IsAuthenticated: true })
+                {
+                    Log("LOGIN_CANCELLED_OR_CLOSED; no API calls or remote writes");
+                    return 2;
+                }
 
-            if (session is not { IsAuthenticated: true })
-            {
-                Log("LOGIN_CANCELLED_OR_CLOSED; no API calls or remote writes");
-                return 2;
-            }
-            Log("Fresh human login validated; session is memory-only, never logged");
+                currentSessionForTrace = session;
+                diagnosticPhase = "post-login-read-only";
+                Log("SESSION_VALIDATOR result=PASS; O2LoginForm only returns CapturedSession after O2SessionValidator.Validate(session) accepts it");
+                Log($"SESSION_CAPTURED validationkey_present={!string.IsNullOrWhiteSpace(session.ValidationKey)} " +
+                    $"cookie_count={session.Cookies.Count(pair => !string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value))} " +
+                    $"cookie_header_present={!string.IsNullOrWhiteSpace(session.CookieHeader)} user_agent_present={!string.IsNullOrWhiteSpace(session.UserAgent)} " +
+                    "other_session_fields=none; values_not_logged; profile_retained_through_all_reads");
 
-            var client = new O2CloudApiClient(http, new MemoryAuth(session), "https://cloud.o2online.es/sapi/");
-            var storage = client.GetStorageInfo();
-            var root = client.GetRootFolder();
-            var rootItems = client.ListFolder(root.Id);
-            Log($"READ_ONLY_API_PASS storage=readable; root=readable; root_item_count={rootItems.Count}; names_and_ids_omitted=true; used_bytes={storage.UsedBytes}; total_bytes={storage.TotalBytes}");
-            if (args.Contains("--login-only")) return 0;
+                var memoryAuth = new MemoryAuth(session);
+                var client = new O2CloudApiClient(http, memoryAuth, "https://cloud.o2online.es/sapi/");
+                Log($"SESSION_REUSE same_session_object={ReferenceEquals(session, memoryAuth.Session)} same_http_client_as_validator=true");
 
-            var folders = client.ListFolder(root.Id).Where(x => x.Name == FolderName).ToArray();
+                var allReadsPassed = true;
+                try
+                {
+                    var keepAlive = client.KeepSessionAlive();
+                    Log($"READ_STEP KeepSessionAlive result={(keepAlive ? "PASS" : "FAIL")}");
+                    allReadsPassed &= keepAlive;
+                }
+                catch (Exception ex)
+                {
+                    allReadsPassed = false;
+                    Log("READ_STEP KeepSessionAlive result=FAIL " + SafeHttpTraceHandler.FormatExceptionChain(ex));
+                }
+
+                O2StorageInfo? storage = null;
+                try
+                {
+                    storage = client.GetStorageInfo();
+                    Log($"READ_STEP GetStorageInfo result=PASS used_bytes={storage.UsedBytes} total_bytes={storage.TotalBytes} free_bytes={storage.FreeBytes}");
+                }
+                catch (Exception ex)
+                {
+                    allReadsPassed = false;
+                    Log("READ_STEP GetStorageInfo result=FAIL " + SafeHttpTraceHandler.FormatExceptionChain(ex));
+                }
+
+                O2CloudItemDto? root = null;
+                try
+                {
+                    root = client.GetRootFolder();
+                    Log("READ_STEP GetRootFolder result=PASS root_id_present=true root_name_omitted=true");
+                }
+                catch (Exception ex)
+                {
+                    allReadsPassed = false;
+                    Log("READ_STEP GetRootFolder result=FAIL " + SafeHttpTraceHandler.FormatExceptionChain(ex));
+                }
+
+                if (root is not null)
+                {
+                    try
+                    {
+                        var rootItems = client.ListFolder(root.Id);
+                        Log($"READ_STEP ListRoot result=PASS item_count={rootItems.Count} names_and_ids_omitted=true");
+                    }
+                    catch (Exception ex)
+                    {
+                        allReadsPassed = false;
+                        Log("READ_STEP ListRoot result=FAIL " + SafeHttpTraceHandler.FormatExceptionChain(ex));
+                    }
+                }
+                else
+                {
+                    allReadsPassed = false;
+                    Log("READ_STEP ListRoot result=NOT_RUN root_unavailable");
+                }
+
+                if (args.Contains("--login-only") || args.Contains("--api-read-probe"))
+                {
+                    Log($"READ_ONLY_DIAGNOSTIC_COMPLETE all_steps_passed={allReadsPassed}; no mount; no remote writes");
+                    return allReadsPassed ? 0 : 4;
+                }
+
+                if (!allReadsPassed || storage is null || root is null)
+                {
+                    Log("BLOCKED: read-only preflight incomplete; refusing all real test writes");
+                    return 4;
+                }
+
+                var folders = client.ListFolder(root.Id).Where(x => x.Name == FolderName).ToArray();
             if (folders.Length > 1 || folders.Any(x => !x.IsFolder)) throw new IOException("Ambiguous test folder");
             var folder = folders.SingleOrDefault() ?? client.CreateFolder(root.Id, FolderName);
             if (client.ListFolder(folder.Id).Any(x => x.Name == "overwrite-control.txt" || x.Name == "renamed-control.txt"))
@@ -101,11 +192,22 @@ internal static class Program
             remounted.Unmount();
             Log("REAL VALIDATION PASS; small evidence folder preserved; no writes outside test folder");
             return 0;
+            }
+            finally
+            {
+                if (TryDeleteProfile(profile))
+                {
+                    Log("TEMP_WEBVIEW_PROFILE_REMOVED after all read-only/API steps; cookies/storage not retained on disk");
+                }
+                else
+                {
+                    Log("WARNING: temporary WebView2 profile could not be removed; no further operation attempted");
+                }
+            }
         }
         catch (Exception ex)
         {
-            // API exception bodies/URLs might include session information. Never print them.
-            Log("ABORTED: " + ex.GetType().Name + "; preserve test folder and local transaction journals; no additional operation attempted");
+            Log("ABORTED: " + SafeHttpTraceHandler.FormatExceptionChain(ex) + "; no additional remote operation attempted");
             return 1;
         }
     }
@@ -143,6 +245,7 @@ internal static class Program
 
 internal sealed class MemoryAuth(O2Session session) : IAuthService
 {
+    public O2Session Session => session;
     public O2Session GetCurrentSession() => session;
     public bool HasStoredSession() => false;
     public bool HasValidatedSession => true;
