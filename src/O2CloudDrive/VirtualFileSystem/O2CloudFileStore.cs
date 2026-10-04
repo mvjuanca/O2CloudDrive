@@ -323,7 +323,9 @@ public sealed class O2CloudFileStore : ICloudFileStore
             if (!node.IsNew)
             {
                 _apiClient.RenameOrMove(ToDto(node), newName, newParent.Id);
-                node.RemoteItem = node.RemoteItem is null ? null : node.RemoteItem with { Name = newName, ParentId = newParent.Id };
+                // Servers may update etag/modificationdate even for a metadata rename.
+                node.RemoteItem = _apiClient.ListFolder(newParent.Id).SingleOrDefault(item => item.Id == node.Id && item.Name == newName)
+                    ?? (node.RemoteItem is null ? null : node.RemoteItem with { Name = newName, ParentId = newParent.Id });
                 MarkRemoteChangeHandled();
             }
 
@@ -583,11 +585,15 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             lock (_gate)
             {
-                if (error is RemoteReplacementException replacement && replacement.RecoveryRequired)
+                if (error is RemoteReplacementException replacement)
                 {
-                    node.RecoveryRequired = true;
+                    node.RecoveryRequired = replacement.RecoveryRequired;
                     if (replacement.CurrentItem is not null)
-                        ApplyMetadata(node, replacement.CurrentItem);
+                    {
+                        // Refresh retry identity without overwriting the unsaved local size/bytes.
+                        node.RemoteItem = replacement.CurrentItem;
+                        node.Id = replacement.CurrentItem.Id;
+                    }
                 }
                 node.UploadInProgress = false;
                 node.UploadPendingRemoteConfirmation = false;

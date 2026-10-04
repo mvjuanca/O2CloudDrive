@@ -85,6 +85,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
             // Inspect actual IDs/names before any rollback; never delete a valid copy.
             bool recovered = false;
             O2CloudItemDto? liveNew = null;
+            O2CloudItemDto? rollbackCurrent = null;
             try
             {
                 Record("rollback");
@@ -105,7 +106,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
                     Require(parentId, liveOld.Id, name, original!.Size);
                 }
                 if (original is not null)
-                    Require(parentId, original.Id, name, original.Size);
+                    rollbackCurrent = Require(parentId, original.Id, name, original.Size);
                 else if (api.ListFolder(parentId).Any(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
                     throw new IOException("New target has ambiguous ownership.");
                 recovered = true;
@@ -121,7 +122,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
                 $"O2 Cloud replacement failed ({failedPhase}); {(recovered ? "original preserved; retry possible" : "automatic retry blocked; recovery required")}. Journal: {journal}",
                 // HTTP/API exception bodies may contain credentials. Never log them via WinFsp.
                 new IOException($"Remote failure type: {error.GetType().Name}"), recoveryRequired: !recovered,
-                liveNew?.Name == name ? liveNew : null);
+                recovered ? rollbackCurrent : liveNew?.Name == name ? liveNew : null);
         }
     }
 

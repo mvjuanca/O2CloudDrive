@@ -300,7 +300,7 @@ sealed class FakeApi : IO2CloudApiClient
         if (name == "control.txt" && item.Name.Contains(".upload")) Maybe("promote");
         if (name == "control.txt" && item.Name.Contains(".backup")) Maybe("restore");
         if (files.Values.Any(x => x.Item.Id != item.Id && x.Item.Name == name)) throw new IOException("already exists");
-        var entry = files[item.Id]; files[item.Id] = (entry.Item with { Name = name, ParentId = parent }, entry.Bytes);
+        var entry = files[item.Id]; files[item.Id] = (entry.Item with { Name = name, ParentId = parent, ModifiedAt = DateTimeOffset.UtcNow }, entry.Bytes);
         if (name.Contains(".backup")) Maybe("backup-after");
     } }
     public void MoveToTrash(O2CloudItemDto item) { lock (gate) { Maybe("trash"); trash[item.Id] = files[item.Id]; files.Remove(item.Id); Maybe("trash-after"); } }
