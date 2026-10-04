@@ -14,6 +14,7 @@ public sealed class O2LoginForm : Form
 
     private readonly Uri _loginUri;
     private readonly O2SessionValidator _validator;
+    private readonly string? _userDataFolder;
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly Label _statusLabel = new()
     {
@@ -27,10 +28,11 @@ public sealed class O2LoginForm : Form
     private bool _capturing;
     private string? _lastValidationKey;
 
-    public O2LoginForm(Uri loginUri, O2SessionValidator validator)
+    public O2LoginForm(Uri loginUri, O2SessionValidator validator, string? userDataFolder = null)
     {
         _loginUri = loginUri;
         _validator = validator;
+        _userDataFolder = userDataFolder;
 
         Text = "O2 Cloud - Login";
         Width = 1100;
@@ -87,7 +89,7 @@ public sealed class O2LoginForm : Form
     {
         try
         {
-            var userDataFolder = O2WebViewProfile.UserDataFolder;
+            var userDataFolder = _userDataFolder ?? O2WebViewProfile.UserDataFolder;
             Directory.CreateDirectory(userDataFolder);
 
             var environmentOptions = new CoreWebView2EnvironmentOptions

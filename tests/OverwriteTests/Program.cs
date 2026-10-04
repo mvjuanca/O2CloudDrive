@@ -10,7 +10,7 @@ var reproduce = args.Contains("--reproduce");
 
 O2CloudFileStore Store(FakeApi api) => new(api,
     new ReadCacheOptions(Path.Combine(root, Guid.NewGuid().ToString("N")), 262144, 0, 10000000),
-    Path.Combine(root, "writes"));
+    Path.Combine(root, "writes", api.CacheId));
 CloudNode Node(O2CloudFileStore store, string name = "control.txt")
 {
     Check(store.TryGetByPath("\\" + name, out var node), "node missing");
@@ -36,6 +36,45 @@ void Test(string name, Action action)
 byte[] V(string value) => Encoding.UTF8.GetBytes(value);
 var old = V("CONTROL_VERSION_1");
 var next = V("CONTROL_VERSION_2"); // same size deliberately catches stale confirmation
+
+#if !CORE_ONLY
+if (args.Contains("--mounted"))
+{
+    const string mount = "R:";
+    Check(!Directory.Exists(mount + "\\"), "R: is already in use; refusing mount");
+    var api = new FakeApi(); var store = Store(api);
+    using var host = new Fsp.FileSystemHost(new O2VirtualFileSystem(store, "O2 overwrite OFFLINE"))
+    {
+        FileSystemName = "O2Offline", SectorSize = 512, SectorsPerAllocationUnit = 8,
+        CaseSensitiveSearch = false, CasePreservedNames = true, UnicodeOnDisk = true,
+        PersistentAcls = false, PostCleanupWhenModifiedOnly = false,
+        PassQueryDirectoryPattern = true, FlushAndPurgeOnCleanup = true,
+    };
+    Check(host.Mount(mount, null, false, 0) == 0, "WinFsp mount failed");
+    var path = mount + "\\control.txt";
+    void Saved(byte[] bytes) { File.WriteAllBytes(path, bytes); Check(File.ReadAllBytes(path).SequenceEqual(bytes), "mounted read differs"); Remote(api, "control.txt", bytes); }
+    try
+    {
+        Test("mounted A new", () => Saved(old));
+        Test("mounted B overwrite", () => Saved(next));
+        Test("mounted C repeated", () => { for (int i = 0; i < 3; i++) Saved(V("V" + i)); });
+        Test("mounted D grow", () => Saved(Enumerable.Repeat((byte)7, 500000).ToArray()));
+        Test("mounted E shrink", () => Saved(V("small")));
+        Test("mounted F zero", () => Saved([]));
+        Test("mounted G rename after overwrite", () => { Saved(next); File.Move(path, mount + "\\renamed.txt"); path = mount + "\\renamed.txt"; Remote(api, "renamed.txt", next); });
+        Test("mounted H overwrite after rename", () => { File.WriteAllBytes(path, old); Remote(api, "renamed.txt", old); });
+        Test("mounted I repeated flush", () => { using var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read); stream.Write(next); stream.SetLength(next.Length); for (int i = 0; i < 3; i++) stream.Flush(true); Remote(api, "renamed.txt", next); });
+        Test("mounted J reopen", () => Check(File.ReadAllBytes(path).SequenceEqual(next), "mounted reopen stale"));
+        Test("mounted L explicit Flush remote error", () => {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read);
+            stream.Write(old); api.Fail("upload"); ExpectIOException(() => stream.Flush(true));
+        });
+    }
+    finally { host.Unmount(); }
+    Console.WriteLine($"MOUNTED TOTAL {results.Count(x => x.Passed)}/{results.Count} PASS; R: unmounted");
+    return results.All(x => x.Passed) ? 0 : 1;
+}
+#endif
 
 if (reproduce)
 {
@@ -82,8 +121,13 @@ Test("H overwrite after rename", () => {
 });
 Test("I repeated Flush/Cleanup", () => {
     var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
-    var fs = new O2VirtualFileSystem(store, "test"); store.ReplaceContent(n, next);
+    store.ReplaceContent(n, next);
+#if CORE_ONLY
+    for (int i = 0; i < 3; i++) Commit(store, n);
+#else
+    var fs = new O2VirtualFileSystem(store, "test");
     for (int i = 0; i < 3; i++) { Check(fs.Flush(n, new object(), out _) == 0, "flush failed"); fs.Cleanup(n, new object(), "\\control.txt", 0); }
+#endif
     Check(SpinWait.SpinUntil(() => !n.UploadInProgress, 10000), "cleanup pending");
     Remote(api, "control.txt", next); Check(api.UploadCount == 1, "double upload");
 });
@@ -132,6 +176,62 @@ Test("S write races with commit", () => {
     Thread.Sleep(100); api.UploadRelease.Set(); Task.WaitAll(commit, write);
     Commit(store, n); Remote(api, "control.txt", V("V3"));
 });
+Test("T corrupt uploaded bytes keep original", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); api.CorruptUpload = true;
+    ExpectIOException(() => Commit(store, n)); Remote(api, "control.txt", old); Check(n.IsDirty, "retry lost");
+});
+Test("U lost response after original rename rolls back", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); api.Fail("backup-after");
+    ExpectIOException(() => Commit(store, n)); Remote(api, "control.txt", old);
+});
+Test("V rollback failure blocks mutations and restart", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); api.Fail("promote"); api.Fail("restore");
+    ExpectIOException(() => Commit(store, n));
+    ExpectIOException(() => store.ReplaceContent(n, V("V3")));
+    Check(api.ListFolder("root").Any(x => api.Bytes(x.Id).SequenceEqual(old)), "last old copy lost");
+    var fresh = Store(api); var created = fresh.Create("\\control.txt", CloudItemKind.File, 0);
+    fresh.ReplaceContent(created, next); var count = api.UploadCount;
+    ExpectIOException(() => Commit(fresh, created)); Check(api.UploadCount == count, "restart replayed unfinished transaction");
+});
+Test("W lost retirement response preserves verified new copy", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); api.Fail("trash-after");
+    ExpectIOException(() => Commit(store, n)); Remote(api, "control.txt", next);
+    ExpectIOException(() => Commit(store, n)); Check(api.ListTrash().Count == 1, "old copy not in trash");
+});
+Test("X Flush exposes remote failure", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); api.Fail("upload");
+#if CORE_ONLY
+    ExpectIOException(() => Commit(store, n));
+#else
+    var fs = new O2VirtualFileSystem(store, "test");
+    ExpectIOException(() => fs.Flush(n, new object(), out _));
+#endif
+    Check(n.IsDirty, "flush lost dirty state");
+});
+#if !CORE_ONLY
+Test("Y read-only Cleanup does not commit open writer", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    var fs = new O2VirtualFileSystem(store, "test");
+    Check(fs.Open("\\control.txt", 0, 1, out var fn, out var fd, out _, out _) == 0, "read open failed");
+    store.ReplaceContent(n, next); fs.Cleanup(fn, fd, "\\control.txt", 0);
+    Check(api.UploadCount == 0, "read-only close committed writer"); Commit(store, n); Remote(api, "control.txt", next);
+});
+Test("Z two writers commit on last Cleanup only", () => {
+    var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    var fs = new O2VirtualFileSystem(store, "test");
+    Check(fs.Open("\\control.txt", 0, 2, out var fn, out var first, out _, out _) == 0, "open1");
+    Check(fs.Open("\\control.txt", 0, 2, out _, out var second, out _, out _) == 0, "open2");
+    store.ReplaceContent(n, next); fs.Cleanup(fn, first, "\\control.txt", 0);
+    Check(api.UploadCount == 0, "first close committed unfinished writer");
+    fs.Cleanup(fn, second, "\\control.txt", 0); fs.Cleanup(fn, second, "\\control.txt", 0);
+    Check(api.UploadCount == 1, "last close duplicated upload"); Remote(api, "control.txt", next);
+});
+#endif
 Console.WriteLine($"TOTAL {results.Count(x => x.Passed)}/{results.Count} PASS; isolated-cache={root}");
 return results.All(x => x.Passed) ? 0 : 1;
 
@@ -149,6 +249,8 @@ sealed class FakeApi : IO2CloudApiClient
     readonly Dictionary<string, (O2CloudItemDto Item, byte[] Bytes)> trash = new();
     readonly HashSet<string> failures = new();
     int serial; public int UploadCount;
+    public string CacheId { get; } = Guid.NewGuid().ToString("N");
+    public bool CorruptUpload;
     public bool BlockUpload;
     public ManualResetEventSlim UploadStarted = new(false), UploadRelease = new(false);
     public void Fail(string phase) { lock (gate) failures.Add(phase); }
@@ -174,16 +276,19 @@ sealed class FakeApi : IO2CloudApiClient
             Maybe("upload"); using var memory = new MemoryStream(); stream.CopyTo(memory);
             var candidate = name; int i = 0;
             while (files.Values.Any(x => x.Item.Name == candidate)) candidate = Path.GetFileNameWithoutExtension(name) + " (" + ++i + ")" + Path.GetExtension(name);
-            return Seed(candidate, memory.ToArray());
+            var bytes = memory.ToArray(); if (CorruptUpload && bytes.Length > 0) bytes[0] ^= 255;
+            return Seed(candidate, bytes);
         }
     }
     void CheckWait() { if (!UploadRelease.Wait(5000)) throw new IOException("test upload wait timeout"); }
     public void RenameOrMove(O2CloudItemDto item, string name, string parent) { lock (gate) {
-        if (name == "control.txt" && item.Name != "control.txt") Maybe("promote");
+        if (name == "control.txt" && item.Name.Contains(".upload")) Maybe("promote");
+        if (name == "control.txt" && item.Name.Contains(".backup")) Maybe("restore");
         if (files.Values.Any(x => x.Item.Id != item.Id && x.Item.Name == name)) throw new IOException("already exists");
         var entry = files[item.Id]; files[item.Id] = (entry.Item with { Name = name, ParentId = parent }, entry.Bytes);
+        if (name.Contains(".backup")) Maybe("backup-after");
     } }
-    public void MoveToTrash(O2CloudItemDto item) { lock (gate) { Maybe("trash"); trash[item.Id] = files[item.Id]; files.Remove(item.Id); } }
+    public void MoveToTrash(O2CloudItemDto item) { lock (gate) { Maybe("trash"); trash[item.Id] = files[item.Id]; files.Remove(item.Id); Maybe("trash-after"); } }
     public O2CloudItemDto RestoreFromTrash(O2CloudItemDto item) { lock (gate) { files[item.Id] = trash[item.Id]; trash.Remove(item.Id); return files[item.Id].Item; } }
     public void PermanentlyDelete(O2CloudItemDto item) { lock (gate) { files.Remove(item.Id); trash.Remove(item.Id); } }
 }

@@ -493,7 +493,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
     public void Commit(CloudNode node)
     {
         lock (node.CommitGate)
-        {
+            CommitSerialized(node);
+    }
+
+    private void CommitSerialized(CloudNode node)
+    {
         EnsureRecoveryNotRequired(node);
         O2CloudItemDto? previous;
         string parentId;
@@ -539,7 +543,6 @@ public sealed class O2CloudFileStore : ICloudFileStore
         }
 
         UploadCommittedFile(node, previous, parentId, name, size, contentPath, contentBytes, wasNew);
-        }
     }
 
     private void UploadCommittedFile(

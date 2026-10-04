@@ -184,6 +184,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         var handle = fileDesc as OpenFileHandle;
         if ((flags & CleanupDelete) != 0 || handle?.DeleteOnClose == true)
         {
+            handle?.ReleaseWriter();
             _store.Delete(node);
             return;
         }
