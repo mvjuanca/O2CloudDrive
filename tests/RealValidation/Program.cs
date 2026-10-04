@@ -30,20 +30,36 @@ internal static class Program
             Application.EnableVisualStyles();
             using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
             var validator = new O2SessionValidator(http, "https://cloud.o2online.es/sapi/");
-            using var form = new O2LoginForm(new Uri("https://cloud.o2online.es/"), validator, Path.Combine(work, "fresh-webview"));
-            using var timeout = new System.Windows.Forms.Timer { Interval = 90000 };
-            timeout.Tick += (_, _) => { Log("BLOCKED: human login not completed within 90 seconds; no remote writes"); form.Close(); };
-            form.Shown += (_, _) => { Log("HUMAN_LOGIN_WINDOW_OPEN; fresh isolated profile; no saved credentials read"); timeout.Start(); };
-            form.ShowDialog(); timeout.Stop();
-            if (form.CapturedSession is not { IsAuthenticated: true } session)
+            var profile = Path.Combine(Path.GetTempPath(), "O2CloudDrive-login-test2-" + Guid.NewGuid().ToString("N"));
+            O2Session? session;
+            using (var form = new O2LoginForm(new Uri("https://cloud.o2online.es/"), validator, profile, Log))
             {
-                Log("TODO EL TRABAJO OFFLINE COMPLETADO; FALTA LOGIN HUMANO PARA VALIDACIÓN REAL");
+                form.Shown += (_, _) => Log("HUMAN_LOGIN_WINDOW_OPEN; isolated temporary WebView2 profile; no Credential Manager or old profile read; no timeout");
+                form.ShowDialog();
+                session = form.CapturedSession;
+            }
+
+            if (!TryDeleteProfile(profile))
+            {
+                Log("BLOCKED: temporary WebView2 profile could not be removed; stopped before API validation to avoid retaining browser session data");
+                return 3;
+            }
+            Log("TEMP_WEBVIEW_PROFILE_REMOVED; cookies/storage not retained on disk");
+
+            if (session is not { IsAuthenticated: true })
+            {
+                Log("LOGIN_CANCELLED_OR_CLOSED; no API calls or remote writes");
                 return 2;
             }
             Log("Fresh human login validated; session is memory-only, never logged");
-            if (args.Contains("--login-only")) return 0;
+
             var client = new O2CloudApiClient(http, new MemoryAuth(session), "https://cloud.o2online.es/sapi/");
+            var storage = client.GetStorageInfo();
             var root = client.GetRootFolder();
+            var rootItems = client.ListFolder(root.Id);
+            Log($"READ_ONLY_API_PASS storage=readable; root=readable; root_item_count={rootItems.Count}; names_and_ids_omitted=true; used_bytes={storage.UsedBytes}; total_bytes={storage.TotalBytes}");
+            if (args.Contains("--login-only")) return 0;
+
             var folders = client.ListFolder(root.Id).Where(x => x.Name == FolderName).ToArray();
             if (folders.Length > 1 || folders.Any(x => !x.IsFolder)) throw new IOException("Ambiguous test folder");
             var folder = folders.SingleOrDefault() ?? client.CreateFolder(root.Id, FolderName);
@@ -92,6 +108,22 @@ internal static class Program
             Log("ABORTED: " + ex.GetType().Name + "; preserve test folder and local transaction journals; no additional operation attempted");
             return 1;
         }
+    }
+
+    private static bool TryDeleteProfile(string path)
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+                return !Directory.Exists(path);
+            }
+            catch (IOException) { Thread.Sleep(500); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(500); }
+        }
+
+        return false;
     }
 
     private static FileSystemHost Mount(ICloudFileStore store)

@@ -15,6 +15,7 @@ public sealed class O2LoginForm : Form
     private readonly Uri _loginUri;
     private readonly O2SessionValidator _validator;
     private readonly string? _userDataFolder;
+    private readonly Action<string>? _diagnosticLog;
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly Label _statusLabel = new()
     {
@@ -26,13 +27,16 @@ public sealed class O2LoginForm : Form
     private readonly System.Windows.Forms.Timer _captureTimer = new() { Interval = 2000 };
     private readonly HashSet<string> _seenUrls = new(StringComparer.OrdinalIgnoreCase);
     private bool _capturing;
+    private bool _webLoginAdvanceInFlight;
+    private bool _webLoginAdvanceStarted;
     private string? _lastValidationKey;
 
-    public O2LoginForm(Uri loginUri, O2SessionValidator validator, string? userDataFolder = null)
+    public O2LoginForm(Uri loginUri, O2SessionValidator validator, string? userDataFolder = null, Action<string>? diagnosticLog = null)
     {
         _loginUri = loginUri;
         _validator = validator;
         _userDataFolder = userDataFolder;
+        _diagnosticLog = diagnosticLog;
 
         Text = "O2 Cloud - Login";
         Width = 1100;
@@ -73,6 +77,7 @@ public sealed class O2LoginForm : Form
         _captureTimer.Tick += async (_, _) =>
         {
             await AcceptCookieConsentAsync();
+            await TryAdvanceToWebLoginAsync();
             await CaptureAndValidateAsync();
         };
         Shown += async (_, _) => await InitializeWebViewAsync();
@@ -107,11 +112,31 @@ public sealed class O2LoginForm : Form
             _webView.CoreWebView2.NewWindowRequested += (_, args) =>
             {
                 args.Handled = true;
-                _webView.CoreWebView2.Navigate(args.Uri);
+                if (Uri.TryCreate(args.Uri, UriKind.Absolute, out var popupUri) &&
+                    O2LoginFlowPolicy.IsO2OwnedHttpsUri(popupUri) &&
+                    !O2LoginFlowPolicy.IsAppStoreUri(popupUri))
+                {
+                    DiagnosticLog($"POPUP route={O2LoginFlowPolicy.SanitizeUri(args.Uri)} routed_in_current_view=true");
+                    _webView.CoreWebView2.Navigate(args.Uri);
+                }
+                else
+                {
+                    DiagnosticLog($"POPUP_BLOCKED route={O2LoginFlowPolicy.SanitizeUri(args.Uri)}");
+                }
             };
             _webView.CoreWebView2.NavigationStarting += (_, args) =>
             {
+                if (Uri.TryCreate(args.Uri, UriKind.Absolute, out var navigationUri) &&
+                    O2LoginFlowPolicy.IsAppStoreUri(navigationUri))
+                {
+                    args.Cancel = true;
+                    _statusLabel.Text = "Se mantiene el acceso web de O2 Cloud; no se abrirá una tienda de aplicaciones.";
+                    DiagnosticLog($"APP_STORE_NAVIGATION_BLOCKED route={O2LoginFlowPolicy.SanitizeUri(args.Uri)}");
+                    return;
+                }
+
                 TrackUrl(args.Uri);
+                DiagnosticLog($"NAV_START redirected={args.IsRedirected} route={O2LoginFlowPolicy.SanitizeUri(args.Uri)}");
                 _statusLabel.Text = "Login oficial de O2 Cloud cargando...";
                 if (TryExtractValidationKey(args.Uri, out var validationKey))
                 {
@@ -119,10 +144,24 @@ public sealed class O2LoginForm : Form
                     BeginInvoke(async () => await CaptureAndValidateAsync(validationKey));
                 }
             };
-            _webView.CoreWebView2.NavigationCompleted += async (_, _) =>
+            _webView.CoreWebView2.WebResourceResponseReceived += (_, args) =>
             {
+                if (!string.Equals(args.Request.Method, "GET", StringComparison.OrdinalIgnoreCase) ||
+                    !Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var responseUri) ||
+                    !IsLoginHost(responseUri))
+                {
+                    return;
+                }
+
+                DiagnosticLog($"HTTP_RESPONSE status={args.Response.StatusCode} route={O2LoginFlowPolicy.SanitizeUri(args.Request.Uri)}");
+            };
+            _webView.CoreWebView2.NavigationCompleted += async (_, args) =>
+            {
+                DiagnosticLog($"NAV_COMPLETE success={args.IsSuccess} error={args.WebErrorStatus}");
+                await LogSafePageSnapshotAsync();
                 _statusLabel.Text = "Esperando telefono, contrasena y codigo SMS de O2 Cloud...";
                 await AcceptCookieConsentAsync();
+                await TryAdvanceToWebLoginAsync();
                 await CaptureAndValidateAsync();
                 if (CapturedSession is null)
                 {
@@ -131,7 +170,9 @@ public sealed class O2LoginForm : Form
             };
             _webView.CoreWebView2.DOMContentLoaded += async (_, _) =>
             {
+                await LogSafePageSnapshotAsync();
                 await AcceptCookieConsentAsync();
+                await TryAdvanceToWebLoginAsync();
                 await CaptureAndValidateAsync();
             };
 
@@ -155,11 +196,127 @@ public sealed class O2LoginForm : Form
 
         try
         {
-            await _webView.ExecuteScriptAsync(CookieConsentScript);
+            var result = await _webView.ExecuteScriptAsync(CookieConsentScript);
+            if (string.Equals(result, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                DiagnosticLog("COOKIE_CONSENT_ACCEPTED_BY_SCOPED_COOKIE_CONTROL");
+            }
         }
         catch
         {
             // The login page can navigate while the script is running.
+        }
+    }
+
+    private async Task TryAdvanceToWebLoginAsync()
+    {
+        if (_webLoginAdvanceStarted || _webLoginAdvanceInFlight || _webView.CoreWebView2 is null ||
+            !Uri.TryCreate(_webView.CoreWebView2.Source, UriKind.Absolute, out var currentUri))
+        {
+            return;
+        }
+
+        _webLoginAdvanceInFlight = true;
+        try
+        {
+            var raw = await _webView.ExecuteScriptAsync(LandingProbeScript);
+            using var state = JsonDocument.Parse(raw);
+            var root = state.RootElement;
+            var headings = ReadStringArray(root, "headings");
+            var buttons = ReadStringArray(root, "buttons");
+            var consentVisible = root.TryGetProperty("cookieConsentVisible", out var consent) && consent.ValueKind == JsonValueKind.True;
+
+            if (!O2LoginFlowPolicy.ShouldAdvanceToWebLogin(currentUri, headings, buttons, consentVisible))
+            {
+                return;
+            }
+
+            var result = await _webView.ExecuteScriptAsync(ClickWebAccessButtonScript);
+            if (string.Equals(result.Trim('"'), "clicked", StringComparison.Ordinal))
+            {
+                _webLoginAdvanceStarted = true;
+                DiagnosticLog("WEB_ACCESS_CTA_CLICKED; dynamic O2 navigation retained; no fixed SSO URL");
+            }
+        }
+        catch
+        {
+            // The page can navigate while its public login landing is being inspected.
+        }
+        finally
+        {
+            _webLoginAdvanceInFlight = false;
+        }
+    }
+
+    private async Task LogSafePageSnapshotAsync()
+    {
+        if (_diagnosticLog is null || _webView.CoreWebView2 is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var raw = await _webView.ExecuteScriptAsync(PageDiagnosticScript);
+            using var document = JsonDocument.Parse(raw);
+            var root = document.RootElement;
+            var flags = root.GetProperty("flags");
+            bool Flag(string name) => flags.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
+            var snapshot = new
+            {
+                route = O2LoginFlowPolicy.SanitizeUri(GetJsonString(root, "route")),
+                title = GetJsonString(root, "title") ?? string.Empty,
+                userAgent = GetJsonString(root, "userAgent") ?? string.Empty,
+                viewport = GetJsonString(root, "viewport") ?? string.Empty,
+                webAccess = Flag("webAccess"),
+                phonePrompt = Flag("phonePrompt"),
+                smsPrompt = Flag("smsPrompt"),
+                appPromo = Flag("appPromo"),
+                qr = Flag("qr"),
+                emailPassword = Flag("emailPassword"),
+                cookieNotice = Flag("cookieNotice"),
+                inputTypes = ReadStringArray(root, "inputTypes"),
+            };
+
+            DiagnosticLog("PAGE " + JsonSerializer.Serialize(snapshot));
+        }
+        catch
+        {
+            // Diagnostics must not turn a page transition into a login failure.
+        }
+    }
+
+    private static string[] ReadStringArray(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var array) || array.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        return array.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString() ?? string.Empty)
+            .ToArray();
+    }
+
+    private static string? GetJsonString(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static bool IsLoginHost(Uri uri) =>
+        string.Equals(uri.IdnHost, "cloud.o2online.es", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(uri.IdnHost, "t3.o2online.es", StringComparison.OrdinalIgnoreCase);
+
+    private void DiagnosticLog(string message)
+    {
+        try
+        {
+            _diagnosticLog?.Invoke(message);
+        }
+        catch
+        {
+            // Diagnostics must never interrupt authentication.
         }
     }
 
@@ -422,20 +579,24 @@ public sealed class O2LoginForm : Form
                   return false;
                 }
               };
+              const inCookieConsent = (el) => {
+                for (let node = el, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+                  const marker = `${node.id || ''} ${typeof node.className === 'string' ? node.className : ''} ${node.getAttribute?.('role') || ''}`;
+                  const text = clean(node.innerText || node.textContent || '');
+                  if (/cookie|consent|onetrust|cookiebot/i.test(marker) ||
+                      (text.includes('utiliza cookies y tecnologias similares') && text.includes('configurar cookies'))) return true;
+                }
+                return false;
+              };
               const selectors = [
                 '#onetrust-accept-btn-handler',
-                '#accept-recommended-btn-handler',
                 '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
                 '[data-testid="uc-accept-all-button"]',
-                '[data-testid="cookie-accept-all"]',
-                'button[id*="accept" i]',
-                'button[class*="accept" i]',
-                'button[aria-label*="acept" i]',
-                'button[aria-label*="accept" i]'
+                '[data-testid="cookie-accept-all"]'
               ];
               for (const selector of selectors) {
                 for (const el of Array.from(document.querySelectorAll(selector))) {
-                  if (visible(el)) {
+                  if (visible(el) && inCookieConsent(el)) {
                     el.click();
                     return true;
                   }
@@ -444,13 +605,7 @@ public sealed class O2LoginForm : Form
               const controls = Array.from(document.querySelectorAll('button,a,input[type=button],input[type=submit],[role=button]'));
               for (const el of controls) {
                 const text = clean(el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
-                if (visible(el) && (
-                  text.includes('aceptar todas') ||
-                  text.includes('aceptar todo') ||
-                  text.includes('permitir todas') ||
-                  text.includes('accept all') ||
-                  text.includes('allow all') ||
-                  text === 'accept')) {
+                if (visible(el) && text === 'aceptar todas las cookies' && inCookieConsent(el)) {
                   el.click();
                   return true;
                 }
@@ -473,75 +628,57 @@ public sealed class O2LoginForm : Form
           try {
             if (window.__o2CloudDriveAcceptCookies) return window.__o2CloudDriveAcceptCookies();
           } catch (_) {}
-          const clean = (value) => String(value || '')
-            .normalize('NFD')
-            .replace(/[\u0300-\u036f]/g, '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase();
-          const visible = (el) => {
-            try {
-              const rect = el.getBoundingClientRect();
-              const style = getComputedStyle(el);
-              return rect.width > 0 && rect.height > 0 &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none' &&
-                style.opacity !== '0';
-            } catch (_) {
-              return false;
-            }
-          };
-          const roots = [];
-          const visitRoot = (root) => {
-            roots.push(root);
-            try {
-              for (const el of Array.from(root.querySelectorAll('*'))) {
-                if (el.shadowRoot) visitRoot(el.shadowRoot);
-              }
-            } catch (_) {}
-          };
-          visitRoot(document);
-          for (const frame of Array.from(document.querySelectorAll('iframe'))) {
-            try {
-              if (frame.contentDocument) visitRoot(frame.contentDocument);
-            } catch (_) {}
-          }
-          const selectors = [
-            '#onetrust-accept-btn-handler',
-            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
-            '[data-testid="uc-accept-all-button"]',
-            '[data-testid="cookie-accept-all"]',
-            '[id*="accept"][id*="all"]',
-            '[class*="accept"][class*="all"]'
-          ];
-          const textMatches = (text) => {
-            const value = clean(text);
-            return value.includes('aceptar todas') ||
-              value.includes('aceptar todo') ||
-              value.includes('permitir todas') ||
-              value.includes('accept all') ||
-              value.includes('allow all') ||
-              value.includes('agree all');
-          };
-          for (const doc of roots) {
-            for (const selector of selectors) {
-              for (const el of Array.from(doc.querySelectorAll(selector))) {
-                if (visible(el)) {
-                  el.click();
-                  return true;
-                }
-              }
-            }
-            const controls = Array.from(doc.querySelectorAll('button, a, input[type=button], input[type=submit], [role=button]'));
-            for (const el of controls) {
-              const text = el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '';
-              if (visible(el) && textMatches(text)) {
-                el.click();
-                return true;
-              }
-            }
-          }
           return false;
+        })();
+        """;
+
+    private const string LandingProbeScript = """
+        (() => {
+          const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0'; };
+          const headings = Array.from(document.querySelectorAll('h1,h2,[role="heading"]')).filter(visible).map(el => el.innerText || el.textContent || '');
+          const buttons = Array.from(document.querySelectorAll('button,[role="button"]')).filter(visible).map(el => el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+          const cookieConsentVisible = Array.from(document.querySelectorAll('[role="dialog"],#onetrust-banner-sdk,#CybotCookiebotDialog,[class*="cookie" i],[id*="cookie" i]')).some(el => visible(el) && /utiliza cookies/i.test(el.innerText || el.textContent || ''));
+          return { headings, buttons, cookieConsentVisible };
+        })();
+        """;
+
+    private const string ClickWebAccessButtonScript = """
+        (() => {
+          const clean = (value) => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0'; };
+          const heading = Array.from(document.querySelectorAll('h1,h2,[role="heading"]')).some(el => visible(el) && clean(el.innerText || el.textContent).includes('tus contenidos siempre a salvo'));
+          const cookie = Array.from(document.querySelectorAll('[role="dialog"],#onetrust-banner-sdk,#CybotCookiebotDialog,[class*="cookie" i],[id*="cookie" i]')).some(el => visible(el) && /utiliza cookies/i.test(el.innerText || el.textContent || ''));
+          const buttons = Array.from(document.querySelectorAll('button,[role="button"]')).filter(el => visible(el) && clean(el.innerText || el.textContent || el.getAttribute('aria-label')) === 'acceder');
+          if (location.origin === 'https://cloud.o2online.es' && location.pathname.replace(/\/+$/, '') === '/login' && heading && !cookie && buttons.length === 1) {
+            buttons[0].click();
+            return 'clicked';
+          }
+          return 'not-eligible';
+        })();
+        """;
+
+    private const string PageDiagnosticScript = """
+        (() => {
+          const text = document.body?.innerText || '';
+          const clean = (value) => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+          const flags = {
+            webAccess: Array.from(document.querySelectorAll('button,[role="button"]')).some(el => clean(el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim() === 'acceder'),
+            phonePrompt: /introduce tu numero de movil/i.test(clean(text)),
+            smsPrompt: /te enviaremos un codigo por sms/i.test(clean(text)),
+            appPromo: /obtener la app/i.test(clean(text)),
+            qr: /\bqr\b/i.test(text) || Array.from(document.images).some(el => /qr/i.test(el.alt || '')),
+            emailPassword: /inicia sesion con email y contrasena/i.test(clean(text)),
+            cookieNotice: /utiliza cookies y tecnologias similares/i.test(clean(text))
+          };
+          const hashRoute = location.hash ? location.hash.split('?')[0] : '';
+          return {
+            route: location.origin + location.pathname + hashRoute + (location.search || location.hash.includes('?') ? '?[redacted]' : ''),
+            title: document.title || '',
+            userAgent: navigator.userAgent || '',
+            viewport: `${innerWidth}x${innerHeight}`,
+            flags,
+            inputTypes: Array.from(document.querySelectorAll('input')).map(el => el.type || 'text')
+          };
         })();
         """;
 }
