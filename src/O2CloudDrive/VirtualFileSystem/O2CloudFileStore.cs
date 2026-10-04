@@ -64,15 +64,19 @@ public sealed class O2CloudFileStore : ICloudFileStore
     {
     }
 
-    public O2CloudFileStore(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions)
+    public O2CloudFileStore(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions, string? writeCacheDirectory = null)
     {
         _apiClient = apiClient;
         _readCacheDirectory = Path.Combine(readCacheOptions.CacheDirectory, "ReadBlocks");
         _readCacheBlockSizeBytes = Math.Clamp(readCacheOptions.BlockSizeBytes, MinReadCacheBlockSizeBytes, MaxReadCacheBlockSizeBytes);
         _readAheadBlocks = Math.Clamp(readCacheOptions.ReadAheadBlocks, 0, MaxReadAheadBlocks);
         _readCacheMaxBytes = Math.Max(0, readCacheOptions.MaxBytes);
-        PurgeStaleWriteCaches();
-        _localContentDirectory = Path.Combine(BaseWriteCacheDirectory, Guid.NewGuid().ToString("N"));
+        // Tests and portable validation must not touch another installation's write cache.
+        if (writeCacheDirectory is null)
+        {
+            PurgeStaleWriteCaches();
+        }
+        _localContentDirectory = Path.Combine(writeCacheDirectory ?? BaseWriteCacheDirectory, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_localContentDirectory);
         Directory.CreateDirectory(_readCacheDirectory);
         var root = _apiClient.GetRootFolder();
