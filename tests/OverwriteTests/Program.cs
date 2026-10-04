@@ -303,10 +303,12 @@ sealed class FakeApi : IO2CloudApiClient
 sealed class UploadInspector : HttpMessageHandler
 {
     public bool Checked;
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendAsync(request, cancellationToken).GetAwaiter().GetResult();
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         if (request.Method != HttpMethod.Post || request.RequestUri?.AbsolutePath != "/sapi/upload" ||
-            request.RequestUri.Query != "?action=save") throw new Exception("unexpected upload endpoint");
+            !request.RequestUri.Query.StartsWith("?action=save", StringComparison.Ordinal)) throw new Exception("unexpected upload endpoint");
         var multipart = request.Content as MultipartFormDataContent ?? throw new Exception("not multipart");
         var data = multipart.Single(x => x.Headers.ContentDisposition?.Name?.Trim('"') == "data");
         using var json = System.Text.Json.JsonDocument.Parse(await data.ReadAsStringAsync(cancellationToken));
