@@ -40,10 +40,10 @@ Antes: `baseline-reproduction.log` demuestra el defecto y `baseline-regression.l
 
 Repetir offline: `tools/Build-Test.ps1`. Requiere SDK .NET 8 y WinFsp para el bloque montado; los tests core no necesitan WinFsp.
 
-## Validación real preparada, no realizada
+## Validación real: lectura iniciada, overwrite no ejecutado
 
-`artifacts/real-validation-runner/RealValidation.exe --validate` inicia **login humano nuevo** en perfil WebView separado, sin Credential Manager ni sesión antigua. Límite de login 90 s; no permanece como servicio. No imprime secretos. Después puede montar R: (debe estar libre) con un guard de alcance: todas las mutaciones/downloads del store se restringen al ID de `O2CloudDrive-Overwrite-Test-20261004`. No hay Delete permanente ni Restore habilitado. Crear esa carpeta en raíz es la única mutación inicial fuera de su ID, expresamente solicitada.
+Runner actual: `artifacts/real-validation-runner-test2/RealValidation.exe --login-only`. Usa login O2 humano nuevo en perfil WebView temporal, sin Credential Manager ni sesión antigua y sin límite de 90 s. Después de que el validador aceptó una sesión en memoria, intentó solo lecturas: espacio, raíz y listado. El primer GET de espacio falló con `HttpRequestException`, así que la raíz no llegó a consultarse. Perfil temporal eliminado; no montó R: ni escribió en O2.
 
-Se niega a pisar un archivo de control de un run anterior. Verifica V1→V2→V3, ID/name/size/hash, remoto/local/count=1, ausencia de sufijo; rename; 2048→5→0→FINAL-V3; store nuevo y remount. No borra la carpeta de evidencia. Ante error aborta y conserva journal/temporales. Los errores de red artificiales **no** se inyectan en la cuenta real.
+El runner `--validate` sigue siendo el que puede ejecutar la prueba controlada, solo después de superar lecturas de espacio y raíz. Su guard limita operaciones al ID de `O2CloudDrive-Overwrite-Test-20261004`; se niega a pisar archivos de control previos. No hay Delete permanente ni Restore habilitado. La única mutación preparatoria prevista es crear la carpeta de control en raíz, expresamente dentro del alcance autorizado. Los errores artificiales no se inyectan en la cuenta real.
 
-La prueba final de esta tarea solo abre `--login-only`: no monta ni escribe en O2, incluso si el usuario completa el login. El modo real completo queda para ejecutar después con login humano presente. Esta separación impide operaciones desatendidas cuando solo queríamos dejar el prompt.
+La matriz de resultados reales permanece **BLOCKED/no validada** para todos los casos de overwrite, rename, tamaño, remount y conflicto. No confundir los PASS de backend simulado con validación de producción. Detalles del login y lectura fallida: `LOGIN_FLOW_DIAGNOSIS.md` y `REAL_O2_VALIDATION.md`.

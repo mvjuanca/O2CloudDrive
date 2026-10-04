@@ -28,9 +28,9 @@ Fecha: 04/10/2026. Workspace independiente: `C:\Users\mvjua\Documents\Proyectos\
 20. **Linux:** sí, el fix es reutilizable; su clase no depende de Windows y el store se compila/prueba net8.0. No se construyó aplicación Linux.
 21. **Partes reutilizables:** aproximadamente 51% de líneas en carpetas candidatas Core en la medición descrita en LINUX_PORTABILITY; no porcentaje de esfuerzo ni de port completado. API/store/caché/DTO/transferencias son candidatas; algunos componentes adicionales de auth/config también.
 22. **Falta Linux:** FUSE3/binding/errno/handles, auth humana legítima/retorno, session store/keyring, packaging/rutas/permisos y tests reales de SO. No se instaló FUSE ni se accedió a la Pi.
-23. **O2 real:** BLOCKED login humano nuevo. No se reutilizaron sesiones ni credenciales históricas y no se hicieron operaciones de archivos sobre la cuenta.
+23. **O2 real (actualización 04/10):** `test2` siguió el flujo oficial de O2/Telefónica; el validador aceptó una sesión solo en memoria. El primer GET de espacio falló con `HttpRequestException`, la raíz no llegó a consultarse y no hubo escrituras. No se registran ni retienen credenciales/cookies.
 24. **WinFsp necesario:** sí para las pruebas montadas, y ya estaba instalado; el core/API no lo necesita.
-25. **Login humano:** pendiente. Runner usa O2LoginForm normal con perfil nuevo aislado y sin Credential Manager, timeout 90 s. La comprobación al final es login-only: no monta ni muta archivos remotos aunque se autentique.
+25. **Login humano:** runner `test2` con perfil temporal aislado, sin Credential Manager y sin límite de 90 s. Se eliminó el perfil al terminar. La sesión validada llegó a las lecturas de API, pero la lectura de espacio falló; no se montó la unidad.
 26. **V1→V2→V3 real:** BLOCKED, no realizado. PASS en los tests fake/simulados; no confundirlos con producción.
 27. **`(1)` real:** antecedente histórico en issue; desaparece en el backend falso corregido. Ausencia en O2 real actual todavía no verificada.
 28. **Refresh/remount real:** BLOCKED. Store nuevo y reopen offline PASS; runner preparado para montar/remontar únicamente la carpeta aislada después de un login humano.
@@ -43,14 +43,12 @@ Fecha: 04/10/2026. Workspace independiente: `C:\Users\mvjua\Documents\Proyectos\
 
 `tools/Build-Test.ps1` repite tests/build/manifiestos/patch. Requiere SDK .NET 8 y WinFsp para el segmento montado. No solicita refresh de OVMS, no toca Home Assistant, RadioAdmin, MQTT, la radio, Git central ni OneDrive canónico.
 
-Prueba real futura preparada: `artifacts/real-validation-runner/RealValidation.exe --validate`, con login humano y R: libre. Alcance exclusivo `O2CloudDrive-Overwrite-Test-20261004`, guard de IDs en toda mutación/download; preserva evidencia y se niega a pisar un run anterior. No ejecutar sobre carpetas ajenas ni eliminar temporales sin revisar journals.
+Prueba real completa preparada, no ejecutada: `artifacts/real-validation-runner-test2/RealValidation.exe --validate`, con R: libre y solo después de que funcionen las lecturas de espacio/raíz. Alcance exclusivo `O2CloudDrive-Overwrite-Test-20261004`, guard de IDs en toda mutación/download; preserva evidencia y se niega a pisar un run anterior. No ejecutar sobre carpetas ajenas ni eliminar temporales sin revisar journals.
 
-## Conclusión
+## Conclusión actualizada — 04/10/2026
 
-Comprobación final de autenticación: a las 19:52:40 CEST se abrió la ventana `O2 Cloud - Login` del runner login-only, PID 10680, respondiendo, con perfil nuevo. Registro: `artifacts/real-validation-runner/runs/20261004-195240-3075790f51cd41c99ca06a5b046fe815/real-validation.log`. Tiempo máximo 90 s; no montaje ni escritura remota habilitados. No se ha completado una validación de archivos O2 reales en esta tarea.
+La landing que anteriormente mostraba QR contiene una opción web legítima. `test2` la selecciona bajo condiciones estrictas y llega al flujo oficial dinámico de identidad O2; no cambia el User-Agent ni fija URLs SSO. Se quitó el timeout de 90 s. Tests de login 12/12 PASS, overwrite 28/28 PASS, core 25/25 PASS y las publicaciones Release de la app y runner terminaron correctamente. El artefacto previo `test1` permanece con los hashes que figuran arriba.
 
-CORRECCIÓN IMPLEMENTADA Y VALIDADA OFFLINE; FALTA PRUEBA CONTRA O2 REAL
+En la ejecución real, O2SessionValidator aceptó una sesión en memoria, pero `GetStorageInfo` falló con `HttpRequestException`; por eso no se leyó la raíz, no se montó R: y no hubo ninguna escritura remota. **La sobrescritura contra O2 real sigue sin validar.** Ver `docs/LOGIN_FLOW_DIAGNOSIS.md` y `docs/REAL_O2_VALIDATION.md` para los límites y el registro sanitizado.
 
-TODO EL TRABAJO OFFLINE COMPLETADO; FALTA LOGIN HUMANO PARA VALIDACIÓN REAL
-
-O2 CLOUD DRIVE: CORRECCIÓN IMPLEMENTADA Y VALIDADA OFFLINE; PENDIENTE VALIDACIÓN CONTRA O2 REAL
+CORRECCIÓN OFFLINE Y NAVEGACIÓN WEB IMPLEMENTADAS; API REAL NO VALIDADA; OVERWRITE REAL NO EJECUTADO
