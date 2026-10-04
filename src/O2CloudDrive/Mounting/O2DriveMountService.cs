@@ -72,7 +72,8 @@ public sealed class O2DriveMountService : IDisposable
                 CasePreservedNames = true,
                 UnicodeOnDisk = true,
                 PersistentAcls = false,
-                PostCleanupWhenModifiedOnly = true,
+                // Truncate-to-zero can have no Write request. It still needs Cleanup.
+                PostCleanupWhenModifiedOnly = false,
                 PassQueryDirectoryPattern = true,
                 FlushAndPurgeOnCleanup = true,
             };

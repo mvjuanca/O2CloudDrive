@@ -95,7 +95,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         var node = _store.Create(fileName, kind, fileAttributes);
 
         fileNode = node;
-        fileDesc = new OpenFileHandle(node);
+        fileDesc = new OpenFileHandle(node, grantedAccess);
         fileInfo = ToFileInfo(node);
         normalizedName = node.FullPath;
         return STATUS_SUCCESS;
@@ -132,7 +132,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
 
         _store.Touch(node, updateWriteTime: false);
         fileNode = node;
-        fileDesc = new OpenFileHandle(node);
+        fileDesc = new OpenFileHandle(node, grantedAccess);
         fileInfo = ToFileInfo(node);
         normalizedName = node.FullPath;
         TraceOperation(
@@ -188,7 +188,10 @@ public sealed class O2VirtualFileSystem : FileSystemBase
             return;
         }
 
-        _store.Commit(node);
+        // Read-only closes must not commit an unrelated writer's unfinished content.
+        // With several write handles, Cleanup commits only the last writer.
+        if (handle is null || handle.ReleaseWriter())
+            _store.Commit(node);
     }
 
     public override void Close(object fileNode, object fileDesc)
@@ -271,6 +274,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         fileInfo = default;
         if (fileNode is CloudNode node)
         {
+            _store.Commit(node);
             fileInfo = ToFileInfo(node);
         }
 
@@ -594,9 +598,19 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         return size == 0 ? 0 : ((size + allocationUnit - 1) / allocationUnit) * allocationUnit;
     }
 
-    private sealed class OpenFileHandle(CloudNode node)
+    private sealed class OpenFileHandle
     {
-        public CloudNode Node { get; } = node;
+        private readonly bool _writer;
+        private int _cleaned;
+        public OpenFileHandle(CloudNode node, uint grantedAccess)
+        {
+            Node = node;
+            _writer = !node.IsDirectory && (grantedAccess & 0x6) != 0; // FILE_WRITE_DATA | FILE_APPEND_DATA
+            if (_writer) Interlocked.Increment(ref node.OpenWriters);
+        }
+        public CloudNode Node { get; }
         public bool DeleteOnClose { get; set; }
+        public bool ReleaseWriter() => _writer && Interlocked.Exchange(ref _cleaned, 1) == 0 &&
+            Interlocked.Decrement(ref Node.OpenWriters) == 0;
     }
 }

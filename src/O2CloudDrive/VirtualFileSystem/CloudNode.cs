@@ -2,6 +2,10 @@ namespace O2CloudDrive.VirtualFileSystem;
 
 public sealed class CloudNode
 {
+    internal object CommitGate { get; } = new();
+    internal O2CloudDrive.Api.O2CloudItemDto? RemoteItem { get; set; }
+    internal bool RecoveryRequired { get; set; }
+    internal int OpenWriters;
     internal CloudNode(string id, string name, CloudItemKind kind, CloudNode? parent, ulong indexNumber)
     {
         Id = id;

@@ -46,6 +46,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private readonly object _readCacheGate = new();
     private readonly IO2CloudApiClient _apiClient;
     private readonly string _localContentDirectory;
+    private readonly string _transactionDirectory;
     private readonly string _readCacheDirectory;
     private readonly int _readCacheBlockSizeBytes;
     private readonly int _readAheadBlocks;
@@ -72,11 +73,9 @@ public sealed class O2CloudFileStore : ICloudFileStore
         _readAheadBlocks = Math.Clamp(readCacheOptions.ReadAheadBlocks, 0, MaxReadAheadBlocks);
         _readCacheMaxBytes = Math.Max(0, readCacheOptions.MaxBytes);
         // Tests and portable validation must not touch another installation's write cache.
-        if (writeCacheDirectory is null)
-        {
-            PurgeStaleWriteCaches();
-        }
+        // Failed writes/journals survive restart; never purge another session's retry data.
         _localContentDirectory = Path.Combine(writeCacheDirectory ?? BaseWriteCacheDirectory, Guid.NewGuid().ToString("N"));
+        _transactionDirectory = Path.Combine(writeCacheDirectory ?? BaseWriteCacheDirectory, "Transactions");
         Directory.CreateDirectory(_localContentDirectory);
         Directory.CreateDirectory(_readCacheDirectory);
         var root = _apiClient.GetRootFolder();
@@ -200,8 +199,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void Delete(CloudNode node)
     {
+        lock (node.CommitGate)
         lock (_gate)
         {
+            EnsureRecoveryNotRequired(node);
             if (node.Parent is null)
             {
                 throw new InvalidOperationException("The root directory cannot be deleted.");
@@ -247,8 +248,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void Rename(CloudNode node, string newPath, bool replaceIfExists)
     {
+        lock (node.CommitGate)
         lock (_gate)
         {
+            EnsureRecoveryNotRequired(node);
             if (node.Parent is null)
             {
                 throw new InvalidOperationException("The root directory cannot be renamed.");
@@ -287,7 +290,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
                     throw new IOException("The target already exists.");
                 }
 
-                Delete(existing);
+                // Never wait for another node while holding the directory/store lock.
+                if (!Monitor.TryEnter(existing.CommitGate))
+                    throw new IOException("The target has an active write; retry rename after it completes.");
+                try { Delete(existing); }
+                finally { Monitor.Exit(existing.CommitGate); }
             }
 
             if (node.IsTrashItem)
@@ -316,6 +323,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
             if (!node.IsNew)
             {
                 _apiClient.RenameOrMove(ToDto(node), newName, newParent.Id);
+                node.RemoteItem = node.RemoteItem is null ? null : node.RemoteItem with { Name = newName, ParentId = newParent.Id };
                 MarkRemoteChangeHandled();
             }
 
@@ -400,8 +408,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public uint WriteBytes(CloudNode file, ulong offset, byte[] buffer, bool writeToEndOfFile, bool constrainedIo)
     {
+        lock (file.CommitGate)
         lock (_gate)
         {
+            EnsureRecoveryNotRequired(file);
             EnsureFile(file);
             HydrateFile(file);
             var currentLength = LocalContentLength(file);
@@ -441,8 +451,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void ReplaceContent(CloudNode file, byte[] content)
     {
+        lock (file.CommitGate)
         lock (_gate)
         {
+            EnsureRecoveryNotRequired(file);
             EnsureFile(file);
             EnsureEditableLength((ulong)content.LongLength);
             File.WriteAllBytes(EnsureLocalContentPath(file), content);
@@ -457,8 +469,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void SetFileSize(CloudNode file, ulong size)
     {
+        lock (file.CommitGate)
         lock (_gate)
         {
+            EnsureRecoveryNotRequired(file);
             EnsureFile(file);
             EnsureEditableLength(size);
             HydrateFile(file);
@@ -478,6 +492,9 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void Commit(CloudNode node)
     {
+        lock (node.CommitGate)
+        {
+        EnsureRecoveryNotRequired(node);
         O2CloudItemDto? previous;
         string parentId;
         string name;
@@ -511,7 +528,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
             }
 
             wasNew = node.IsNew;
-            previous = wasNew ? null : ToDto(node);
+            previous = wasNew ? null : node.RemoteItem ?? ToDto(node);
             parentId = node.Parent.Id;
             name = node.Name;
             size = checked((long)node.Size);
@@ -519,10 +536,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
             contentBytes = contentPath is null ? node.Content.ToArray() : null;
             node.UploadInProgress = true;
             node.UploadPendingRemoteConfirmation = true;
-            node.IsDirty = false;
         }
 
-        _ = Task.Run(() => UploadCommittedFile(node, previous, parentId, name, size, contentPath, contentBytes, wasNew));
+        UploadCommittedFile(node, previous, parentId, name, size, contentPath, contentBytes, wasNew);
+        }
     }
 
     private void UploadCommittedFile(
@@ -538,19 +555,8 @@ public sealed class O2CloudFileStore : ICloudFileStore
         try
         {
             using var content = OpenCommittedContentForRead(contentPath, contentBytes);
-            var uploaded = _apiClient.UploadFile(parentId, name, content, size);
-            if (previous is not null &&
-                !previous.Id.Equals(uploaded.Id, StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    _apiClient.MoveToTrash(previous);
-                }
-                catch
-                {
-                    // If cleanup of the previous remote object fails, keep the uploaded file visible.
-                }
-            }
+            var uploaded = new RemoteFileReplacement(_apiClient, _transactionDirectory)
+                .Execute(previous, parentId, name, content, size);
 
             lock (_gate)
             {
@@ -570,15 +576,22 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 MarkRemoteChangeHandled();
             }
         }
-        catch
+        catch (Exception error)
         {
             lock (_gate)
             {
+                if (error is RemoteReplacementException replacement && replacement.RecoveryRequired)
+                {
+                    node.RecoveryRequired = true;
+                    if (replacement.CurrentItem is not null)
+                        ApplyMetadata(node, replacement.CurrentItem);
+                }
                 node.UploadInProgress = false;
                 node.UploadPendingRemoteConfirmation = false;
                 node.IsDirty = true;
                 node.IsNew = wasNew;
             }
+            throw;
         }
     }
 
@@ -895,6 +908,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     private static void ApplyMetadata(CloudNode node, O2CloudItemDto item)
     {
+        node.RemoteItem = item;
         node.Id = item.Id;
         node.DeclaredSize = item.IsFolder ? 0UL : (ulong)Math.Max(0, item.Size);
         node.DirectUrl = string.IsNullOrWhiteSpace(item.DirectUrl) ? null : item.DirectUrl;
@@ -1367,24 +1381,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
         return string.IsNullOrWhiteSpace(safe) ? Guid.NewGuid().ToString("N") : safe + ".bin";
     }
 
-    private static void PurgeStaleWriteCaches()
+    private static void EnsureRecoveryNotRequired(CloudNode node)
     {
-        if (!Directory.Exists(BaseWriteCacheDirectory))
-        {
-            return;
-        }
-
-        foreach (var directory in Directory.EnumerateDirectories(BaseWriteCacheDirectory))
-        {
-            try
-            {
-                Directory.Delete(directory, recursive: true);
-            }
-            catch
-            {
-                // A previous process may still be shutting down. Stale cache is ignored, never reused.
-            }
-        }
+        if (node.RecoveryRequired)
+            throw new IOException("O2 Cloud replacement needs recovery; refusing further mutations. Preserve the write cache and transaction journal.");
     }
 
     private static uint NormalizeFileAttributes(uint attributes)
