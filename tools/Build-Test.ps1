@@ -22,7 +22,7 @@ try {
     Copy-Item -LiteralPath LICENSE -Destination artifacts/real-validation-runner/LICENSE
     $manifest = foreach ($directory in @('0.8.4-juanca-test1', 'real-validation-runner')) {
         $basePath = Join-Path $projectRoot "artifacts/$directory"
-        foreach ($file in Get-ChildItem -LiteralPath $basePath -Recurse -File) {
+        foreach ($file in Get-ChildItem -LiteralPath $basePath -Recurse -File | Where-Object FullName -NotMatch '[\\/]runs[\\/]') {
             [pscustomobject]@{ Artifact=$directory; Path=$file.FullName.Substring($basePath.Length+1); Bytes=$file.Length; SHA256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash }
         }
     }

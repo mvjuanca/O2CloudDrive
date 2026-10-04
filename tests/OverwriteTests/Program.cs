@@ -213,6 +213,12 @@ Test("X Flush exposes remote failure", () => {
 #endif
     Check(n.IsDirty, "flush lost dirty state");
 });
+Test("AB externally changed target is not overwritten", () => {
+    var api = new FakeApi(); var item = api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
+    store.ReplaceContent(n, next); var external = V("external version!"); api.ChangeExternally(item.Id, external);
+    ExpectIOException(() => Commit(store, n)); Check(api.UploadCount == 0, "conflict uploaded new object");
+    Remote(api, "control.txt", external); Check(n.IsDirty, "conflict lost local retry bytes");
+});
 #if !CORE_ONLY
 Test("Y read-only Cleanup does not commit open writer", () => {
     var api = new FakeApi(); api.Seed("control.txt", old); var store = Store(api); var n = Node(store);
@@ -266,6 +272,9 @@ sealed class FakeApi : IO2CloudApiClient
         lock (gate) { var id = "file-" + ++serial; var item = new O2CloudItemDto(id, name, "root", false, bytes.Length, DateTimeOffset.UtcNow, null, "file", id, null, null); files[id] = (item, bytes.ToArray()); return item; }
     }
     public byte[] Bytes(string id) { lock (gate) return files[id].Bytes.ToArray(); }
+    public void ChangeExternally(string id, byte[] bytes) { lock (gate) {
+        var entry = files[id]; files[id] = (entry.Item with { Size = bytes.Length, Fingerprint = "external-version", ModifiedAt = DateTimeOffset.UtcNow }, bytes.ToArray());
+    } }
     public O2CloudItemDto GetRootFolder() => new("root", "", null, true, 0, null, null, null, null, null, null);
     public O2StorageInfo GetStorageInfo() => new(0, 1000000000, 1000000000);
     public bool KeepSessionAlive() => true;

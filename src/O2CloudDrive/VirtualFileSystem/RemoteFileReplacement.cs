@@ -42,7 +42,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
             var named = initial.Where(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToArray();
             if (original is null ? named.Length != 0 :
                 named.Length != 1 || named[0].Id != original.Id || named[0].Size != original.Size ||
-                (!string.IsNullOrEmpty(original.Fingerprint) && named[0].Fingerprint != original.Fingerprint))
+                !SameVersion(named[0], original))
                 throw new IOException("Remote target changed; refusing replacement.");
             Record("upload");
             content.Position = 0;
@@ -56,7 +56,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
             {
                 // Recheck the original after upload (external clients are not covered by our lock).
                 var current = Require(parentId, original.Id, name, original.Size);
-                if (!string.IsNullOrEmpty(original.Fingerprint) && current.Fingerprint != original.Fingerprint)
+                if (!SameVersion(current, original))
                     throw new IOException("Original changed while uploading; refusing replacement.");
                 Record("rename-original");
                 api.RenameOrMove(original, backup, parentId);
@@ -146,6 +146,10 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
             throw new IOException($"O2 Cloud unfinished replacement requires recovery before retry. Journal: {path}");
         }
     }
+
+    private static bool SameVersion(O2CloudItemDto current, O2CloudItemDto original)
+        => (string.IsNullOrEmpty(original.Fingerprint) || current.Fingerprint == original.Fingerprint) &&
+           (original.ModifiedAt is null || current.ModifiedAt == original.ModifiedAt);
 
     private O2CloudItemDto Require(string parentId, string id, string name, long size)
     {
