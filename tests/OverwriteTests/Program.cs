@@ -231,6 +231,12 @@ Test("Z two writers commit on last Cleanup only", () => {
     fs.Cleanup(fn, second, "\\control.txt", 0); fs.Cleanup(fn, second, "\\control.txt", 0);
     Check(api.UploadCount == 1, "last close duplicated upload"); Remote(api, "control.txt", next);
 });
+Test("AA actual upload request creates without existing ID", () => {
+    using var handler = new UploadInspector(); using var http = new HttpClient(handler);
+    var client = new O2CloudApiClient(http, new FakeAuth(), "https://example.invalid/sapi/");
+    ExpectIOException(() => client.UploadFile("123", "control.txt", next));
+    Check(handler.Checked, "actual multipart contract not inspected");
+});
 #endif
 Console.WriteLine($"TOTAL {results.Count(x => x.Passed)}/{results.Count} PASS; isolated-cache={root}");
 return results.All(x => x.Passed) ? 0 : 1;
@@ -292,3 +298,31 @@ sealed class FakeApi : IO2CloudApiClient
     public O2CloudItemDto RestoreFromTrash(O2CloudItemDto item) { lock (gate) { files[item.Id] = trash[item.Id]; trash.Remove(item.Id); return files[item.Id].Item; } }
     public void PermanentlyDelete(O2CloudItemDto item) { lock (gate) { files.Remove(item.Id); trash.Remove(item.Id); } }
 }
+
+#if !CORE_ONLY
+sealed class UploadInspector : HttpMessageHandler
+{
+    public bool Checked;
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (request.Method != HttpMethod.Post || request.RequestUri?.AbsolutePath != "/sapi/upload" ||
+            request.RequestUri.Query != "?action=save") throw new Exception("unexpected upload endpoint");
+        var multipart = request.Content as MultipartFormDataContent ?? throw new Exception("not multipart");
+        var data = multipart.Single(x => x.Headers.ContentDisposition?.Name?.Trim('"') == "data");
+        using var json = System.Text.Json.JsonDocument.Parse(await data.ReadAsStringAsync(cancellationToken));
+        var metadata = json.RootElement.GetProperty("data");
+        if (metadata.GetProperty("name").GetString() != "control.txt" || metadata.GetProperty("size").GetInt32() != 17 ||
+            metadata.TryGetProperty("id", out _)) throw new Exception("unexpected upload metadata");
+        Checked = true;
+        throw new IOException("intentional offline transport stop after inspecting request");
+    }
+}
+sealed class FakeAuth : O2CloudDrive.Auth.IAuthService
+{
+    public O2CloudDrive.Auth.O2Session GetCurrentSession() => new() { ValidationKey = "FAKE-NOT-A-CREDENTIAL" };
+    public bool HasStoredSession() => false;
+    public bool HasValidatedSession => true;
+    public O2CloudDrive.Auth.O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false) => GetCurrentSession();
+    public void Logout() { }
+}
+#endif

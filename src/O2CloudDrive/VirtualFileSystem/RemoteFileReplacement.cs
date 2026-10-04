@@ -25,6 +25,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
             {
                 version = 1, time = DateTimeOffset.UtcNow, phase, parentId, name, size, hash,
                 oldId = original?.Id, newId = uploaded?.Id, temporary, backup,
+                localRetryPath = (content as FileStream)?.Name,
             });
             Directory.CreateDirectory(journalDirectory);
             using (var output = new FileStream(journal + ".next", FileMode.Create, FileAccess.Write, FileShare.None))
