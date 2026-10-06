@@ -1,6 +1,8 @@
 using O2CloudDrive.Api;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace O2CloudDrive.VirtualFileSystem;
 
@@ -13,6 +15,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private const int MaxReadAheadBlocks = 8;
     private const string TrashNodeId = "virtual:o2-trash";
     private const string TrashNodeName = "Papelera";
+    private const string PhotoLibraryNodeId = "virtual:o2-photos";
+    private const string PhotoLibraryNodeName = "Fotos";
+    private const int PhotoPageSize = 100;
+    private const int MaxPhotoPages = 10_000;
     private static readonly TimeSpan RemoteChangesCheckInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan ReadCachePruneInterval = TimeSpan.FromMinutes(10);
     private static readonly bool EnableRemoteChangesPolling = false;
@@ -163,6 +169,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
             var parent = GetRequiredParent(normalized);
             EnsureChildrenLoaded(parent);
+            EnsurePhotoTreeReadOnly(parent);
             if (parent.IsVirtualTrashRoot || parent.IsTrashItem)
             {
                 throw new UnauthorizedAccessException("No se pueden crear elementos dentro de la papelera.");
@@ -203,6 +210,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         lock (_gate)
         {
             EnsureRecoveryNotRequired(node);
+            EnsurePhotoTreeReadOnly(node);
             if (node.Parent is null)
             {
                 throw new InvalidOperationException("The root directory cannot be deleted.");
@@ -265,6 +273,8 @@ public sealed class O2CloudFileStore : ICloudFileStore
             var normalized = PathTools.Normalize(newPath);
             var newParent = GetRequiredParent(normalized);
             EnsureChildrenLoaded(newParent);
+            EnsurePhotoTreeReadOnly(node);
+            EnsurePhotoTreeReadOnly(newParent);
             if (node.IsVirtualTrashRoot || newParent.IsVirtualTrashRoot || newParent.IsTrashItem)
             {
                 throw new UnauthorizedAccessException("La papelera no admite renombrar o mover elementos.");
@@ -347,6 +357,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         lock (_gate)
         {
             EnsureFile(file);
+            EnsurePhotoSizeKnown(file);
             HydrateFile(file);
             Touch(file, updateWriteTime: false);
             return HasLocalContent(file)
@@ -363,6 +374,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         lock (_gate)
         {
             EnsureFile(file);
+            EnsurePhotoSizeKnown(file);
             if (length == 0 || offset >= file.Size)
             {
                 return [];
@@ -415,6 +427,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             EnsureRecoveryNotRequired(file);
             EnsureFile(file);
+            EnsurePhotoTreeReadOnly(file);
             HydrateFile(file);
             var currentLength = LocalContentLength(file);
             var writeOffset = writeToEndOfFile ? currentLength : offset;
@@ -458,6 +471,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             EnsureRecoveryNotRequired(file);
             EnsureFile(file);
+            EnsurePhotoTreeReadOnly(file);
             EnsureEditableLength((ulong)content.LongLength);
             File.WriteAllBytes(EnsureLocalContentPath(file), content);
             file.Content = [];
@@ -476,6 +490,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             EnsureRecoveryNotRequired(file);
             EnsureFile(file);
+            EnsurePhotoTreeReadOnly(file);
             EnsureEditableLength(size);
             HydrateFile(file);
             using (var stream = new FileStream(EnsureLocalContentPath(file), FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
@@ -500,6 +515,16 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     private void CommitSerialized(CloudNode node)
     {
+        if (node.IsInVirtualPhotoTree)
+        {
+            if (node.IsDirty || node.IsNew)
+            {
+                EnsurePhotoTreeReadOnly(node);
+            }
+
+            return;
+        }
+
         EnsureRecoveryNotRequired(node);
         O2CloudItemDto? previous;
         string parentId;
@@ -629,6 +654,23 @@ public sealed class O2CloudFileStore : ICloudFileStore
             return;
         }
 
+        if (directory.IsVirtualPhotoRoot)
+        {
+            if (!directory.ChildrenLoaded)
+            {
+                try
+                {
+                    LoadPhotoChildren(directory);
+                }
+                catch (Exception ex)
+                {
+                    LoadListingError(directory, ex);
+                }
+            }
+
+            return;
+        }
+
         if (directory.ChildrenLoaded)
         {
             return;
@@ -650,6 +692,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
         if (directory.Parent is null)
         {
             AddTrashRoot(directory, usedNames);
+            if (_apiClient is IO2PhotoLibraryApi)
+            {
+                AddPhotoLibraryRoot(directory, usedNames);
+            }
         }
 
         foreach (var item in items)
@@ -661,6 +707,179 @@ public sealed class O2CloudFileStore : ICloudFileStore
         }
 
         directory.ChildrenLoaded = true;
+    }
+
+    private void LoadPhotoChildren(CloudNode directory)
+    {
+        if (_apiClient is not IO2PhotoLibraryApi photoApi)
+        {
+            throw new InvalidOperationException("O2 Cloud no expone la biblioteca de fotos en esta sesión.");
+        }
+
+        var photos = new List<O2PhotoMetadata>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pageSignatures = new HashSet<string>(StringComparer.Ordinal);
+        var offset = 0;
+        for (var pageNumber = 0; pageNumber < MaxPhotoPages; pageNumber++)
+        {
+            var page = photoApi.ListPhotoPage(offset, PhotoPageSize);
+            foreach (var photo in page.Photos)
+            {
+                if (!string.IsNullOrWhiteSpace(photo.Id) && seenIds.Add(photo.Id))
+                {
+                    photos.Add(photo);
+                }
+            }
+
+            if (page.HasMore && page.Photos.Count > 0)
+            {
+                var signature = string.Join("\n", page.Photos.Select(photo => photo.Id));
+                if (!pageSignatures.Add(signature))
+                {
+                    throw new IOException("La fototeca repitió una página; se detuvo la lectura para evitar un bucle.");
+                }
+            }
+
+            if (!page.HasMore)
+            {
+                break;
+            }
+
+            if (page.NextOffset <= offset)
+            {
+                throw new IOException("La paginación de la fototeca no avanzó; se detuvo para evitar repetir la consulta.");
+            }
+
+            offset = page.NextOffset;
+            if (pageNumber == MaxPhotoPages - 1)
+            {
+                throw new IOException("La fototeca excedió el límite de páginas de seguridad.");
+            }
+        }
+
+        directory.Children.Clear();
+        var years = new Dictionary<string, CloudNode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var photo in photos)
+        {
+            // The API's `date` field is used for grouping; it is not asserted to be camera capture time.
+            var date = photo.Date?.ToUniversalTime();
+            var yearName = date?.ToString("yyyy", CultureInfo.InvariantCulture) ?? "Sin fecha";
+            if (!years.TryGetValue(yearName, out var yearNode))
+            {
+                yearNode = CreatePhotoDirectory(yearName, directory);
+                directory.Children.Add(yearName, yearNode);
+                years.Add(yearName, yearNode);
+            }
+
+            var parent = yearNode;
+            if (date is not null)
+            {
+                var monthName = date.Value.ToString("MM", CultureInfo.InvariantCulture);
+                if (!yearNode.Children.TryGetValue(monthName, out var monthNode))
+                {
+                    monthNode = CreatePhotoDirectory(monthName, yearNode);
+                    yearNode.Children.Add(monthName, monthNode);
+                }
+
+                parent = monthNode;
+            }
+
+            var fileName = PhotoFileName(photo, date);
+            var usedNames = parent.Children.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            fileName = UniqueName(fileName, photo.Id, usedNames);
+            var fileNode = NewNode("virtual:o2-photo:" + photo.Id, fileName, CloudItemKind.File, parent);
+            fileNode.IsVirtualPhotoNode = true;
+            fileNode.PhotoMetadata = photo;
+            fileNode.MediaKind = photo.MediaType;
+            fileNode.DeclaredSize = photo.Size is >= 0 ? (ulong)photo.Size.Value : 0UL;
+            fileNode.Attributes = FileSystemAttributes.Archive | FileSystemAttributes.Readonly;
+            if (date is not null)
+            {
+                var fileTime = checked((ulong)date.Value.ToFileTime());
+                fileNode.LastWriteTime = fileTime;
+                fileNode.ChangeTime = fileTime;
+            }
+
+            parent.Children.Add(fileNode.Name, fileNode);
+        }
+
+        directory.ChildrenLoaded = true;
+    }
+
+    private CloudNode CreatePhotoDirectory(string name, CloudNode parent)
+    {
+        var node = NewNode("virtual:o2-photo-folder:" + parent.Id + ":" + name, name, CloudItemKind.Directory, parent);
+        node.IsVirtualPhotoNode = true;
+        node.ChildrenLoaded = true;
+        node.Attributes = FileSystemAttributes.Directory | FileSystemAttributes.Readonly;
+        return node;
+    }
+
+    private void AddPhotoLibraryRoot(CloudNode root, ISet<string> usedNames)
+    {
+        var node = NewNode(PhotoLibraryNodeId, PhotoLibraryNodeName, CloudItemKind.Directory, root);
+        node.IsVirtualPhotoNode = true;
+        node.IsVirtualPhotoRoot = true;
+        node.Attributes = FileSystemAttributes.Directory | FileSystemAttributes.Readonly;
+        var name = UniqueName(PhotoLibraryNodeName, PhotoLibraryNodeId, usedNames);
+        node.Name = name;
+        root.Children.Add(name, node);
+    }
+
+    private static string PhotoFileName(O2PhotoMetadata photo, DateTimeOffset? date)
+    {
+        var id = Regex.Replace(photo.Id, "[^A-Za-z0-9_-]", "_");
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            id = "sin-id";
+        }
+
+        var extension = PhotoExtension(photo);
+        var stem = date is null
+            ? "sin-fecha_" + id
+            : date.Value.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + "_" + id;
+        return SanitizeName(stem + extension);
+    }
+
+    private static string PhotoExtension(O2PhotoMetadata photo)
+    {
+        var nameExtension = Path.GetExtension(photo.Name ?? string.Empty);
+        if (Regex.IsMatch(nameExtension, @"^\.[A-Za-z0-9]{1,10}$", RegexOptions.CultureInvariant))
+        {
+            return nameExtension.ToLowerInvariant();
+        }
+
+        var extension = photo.MimeType?.Trim().ToLowerInvariant() switch
+        {
+            "image/jpeg" or "image/jpg" => ".jpg",
+            "image/heic" => ".heic",
+            "image/heif" => ".heif",
+            "image/png" => ".png",
+            "image/gif" => ".gif",
+            "image/webp" => ".webp",
+            "image/avif" => ".avif",
+            "image/bmp" => ".bmp",
+            "image/tiff" => ".tiff",
+            _ => ".img",
+        };
+        return extension;
+    }
+
+    private static void EnsurePhotoTreeReadOnly(CloudNode node)
+    {
+        if (node.IsInVirtualPhotoTree)
+        {
+            throw new UnauthorizedAccessException("La biblioteca virtual Fotos es de solo lectura.");
+        }
+    }
+
+    private static void EnsurePhotoSizeKnown(CloudNode file)
+    {
+        var size = file.PhotoMetadata?.Size;
+        if (file.IsInVirtualPhotoTree && (size is null || size.Value < 0))
+        {
+            throw new IOException("O2 Cloud no devolvió el tamaño de esta foto; no se iniciará una descarga ambigua.");
+        }
     }
 
     private void RefreshForRemoteChangesIfNeeded()
@@ -942,8 +1161,9 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     private static O2CloudItemDto ToDto(CloudNode node)
     {
+        var id = node.PhotoMetadata?.Id ?? node.Id;
         return new O2CloudItemDto(
-            node.Id,
+            id,
             node.Name,
             node.Parent?.Id,
             node.IsDirectory,

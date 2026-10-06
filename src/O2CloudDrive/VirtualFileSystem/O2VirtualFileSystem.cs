@@ -8,6 +8,17 @@ namespace O2CloudDrive.VirtualFileSystem;
 
 public sealed class O2VirtualFileSystem : FileSystemBase
 {
+    private const uint PhotoMutationAccessMask =
+        0x00000002 | // FILE_WRITE_DATA
+        0x00000004 | // FILE_APPEND_DATA
+        0x00000010 | // FILE_WRITE_EA
+        0x00000040 | // FILE_DELETE_CHILD
+        0x00000100 | // FILE_WRITE_ATTRIBUTES
+        0x00010000 | // DELETE
+        0x00040000 | // WRITE_DAC
+        0x00080000 | // WRITE_OWNER
+        0x10000000 | // GENERIC_ALL
+        0x40000000;  // GENERIC_WRITE
     private static readonly bool TraceReads =
         string.Equals(Environment.GetEnvironmentVariable("O2CLOUD_TRACE_READS"), "1", StringComparison.Ordinal);
     private static readonly bool TraceOperations =
@@ -88,6 +99,16 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         out WinFspFileInfo fileInfo,
         out string normalizedName)
     {
+        fileNode = null!;
+        fileDesc = null!;
+        fileInfo = default;
+        normalizedName = string.Empty;
+        var parentPath = PathTools.GetParent(fileName);
+        if (_store.TryGetByPath(parentPath, out var parent) && parent.IsInVirtualPhotoTree)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
         var kind = (createOptions & FILE_DIRECTORY_FILE) != 0
             ? CloudItemKind.Directory
             : CloudItemKind.File;
@@ -130,6 +151,11 @@ public sealed class O2VirtualFileSystem : FileSystemBase
             return STATUS_FILE_IS_A_DIRECTORY;
         }
 
+        if (node.IsInVirtualPhotoTree && (grantedAccess & PhotoMutationAccessMask) != 0)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
         _store.Touch(node, updateWriteTime: false);
         fileNode = node;
         fileDesc = new OpenFileHandle(node, grantedAccess);
@@ -153,6 +179,11 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         if (node.IsDirectory)
         {
             return STATUS_FILE_IS_A_DIRECTORY;
+        }
+
+        if (node.IsInVirtualPhotoTree)
+        {
+            return STATUS_ACCESS_DENIED;
         }
 
         _store.ReplaceContent(node, []);
@@ -263,6 +294,11 @@ public sealed class O2VirtualFileSystem : FileSystemBase
             return STATUS_FILE_IS_A_DIRECTORY;
         }
 
+        if (node.IsInVirtualPhotoTree)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
         var bytes = new byte[checked((int)length)];
         Marshal.Copy(buffer, bytes, 0, checked((int)length));
         bytesTransferred = _store.WriteBytes(node, offset, bytes, writeToEndOfFile, constrainedIo);
@@ -301,6 +337,12 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         out WinFspFileInfo fileInfo)
     {
         var node = GetNode(fileNode);
+        if (node.IsInVirtualPhotoTree)
+        {
+            fileInfo = ToFileInfo(node);
+            return STATUS_ACCESS_DENIED;
+        }
+
         if (fileAttributes != uint.MaxValue)
         {
             node.Attributes = node.IsDirectory
@@ -331,6 +373,11 @@ public sealed class O2VirtualFileSystem : FileSystemBase
             return STATUS_FILE_IS_A_DIRECTORY;
         }
 
+        if (node.IsInVirtualPhotoTree)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
         if (!setAllocationSize)
         {
             _store.SetFileSize(node, newSize);
@@ -343,7 +390,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
     public override int CanDelete(object fileNode, object fileDesc, string fileName)
     {
         var node = GetNode(fileNode);
-        if (node.Parent is null || node.IsVirtualTrashRoot)
+        if (node.Parent is null || node.IsVirtualTrashRoot || node.IsInVirtualPhotoTree)
         {
             return STATUS_ACCESS_DENIED;
         }
@@ -356,6 +403,11 @@ public sealed class O2VirtualFileSystem : FileSystemBase
     public override int SetDelete(object fileNode, object fileDesc, string fileName, bool deleteFile)
     {
         var node = GetNode(fileNode);
+        if (deleteFile && node.IsInVirtualPhotoTree)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
         if (deleteFile)
         {
             var status = CanDelete(fileNode, fileDesc, fileName);
@@ -380,7 +432,15 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         string newFileName,
         bool replaceIfExists)
     {
-        _store.Rename(GetNode(fileNode), newFileName, replaceIfExists);
+        var node = GetNode(fileNode);
+        var parentPath = PathTools.GetParent(newFileName);
+        if (node.IsInVirtualPhotoTree ||
+            (_store.TryGetByPath(parentPath, out var parent) && parent.IsInVirtualPhotoTree))
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+
+        _store.Rename(node, newFileName, replaceIfExists);
         return STATUS_SUCCESS;
     }
 

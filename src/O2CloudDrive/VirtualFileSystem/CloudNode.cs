@@ -48,9 +48,27 @@ public sealed class CloudNode
     public bool IsNew { get; internal set; }
     public bool IsVirtualTrashRoot { get; internal set; }
     public bool IsTrashItem { get; internal set; }
+    public bool IsVirtualPhotoRoot { get; internal set; }
+    public bool IsVirtualPhotoNode { get; internal set; }
+    public O2CloudDrive.Api.O2PhotoMetadata? PhotoMetadata { get; internal set; }
     public bool ChildrenLoaded { get; internal set; }
     public Dictionary<string, CloudNode> Children { get; } = new(StringComparer.OrdinalIgnoreCase);
     public bool IsDirectory => Kind == CloudItemKind.Directory;
+    public bool IsInVirtualPhotoTree
+    {
+        get
+        {
+            for (CloudNode? current = this; current is not null; current = current.Parent)
+            {
+                if (current.IsVirtualPhotoNode)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
     public ulong Size => IsDirectory ? 0UL : DeclaredSize ?? (ulong)Content.LongLength;
 
     public string FullPath

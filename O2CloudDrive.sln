@@ -5,7 +5,11 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{64934C86-C500-4AA0-B356-38DCBDC6CB41}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{DC9F9C67-40DD-4971-9C70-4338A65D2F2B}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "O2CloudDrive", "src\O2CloudDrive\O2CloudDrive.csproj", "{9315D03C-61FF-44E5-B338-E9AD0BCB6929}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PhotoLibraryTests", "tests\PhotoLibraryTests\PhotoLibraryTests.csproj", "{4F2E58B8-0D96-4E82-B728-43C317443584}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -20,8 +24,13 @@ Global
 		{9315D03C-61FF-44E5-B338-E9AD0BCB6929}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9315D03C-61FF-44E5-B338-E9AD0BCB6929}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9315D03C-61FF-44E5-B338-E9AD0BCB6929}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4F2E58B8-0D96-4E82-B728-43C317443584}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4F2E58B8-0D96-4E82-B728-43C317443584}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4F2E58B8-0D96-4E82-B728-43C317443584}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4F2E58B8-0D96-4E82-B728-43C317443584}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{9315D03C-61FF-44E5-B338-E9AD0BCB6929} = {64934C86-C500-4AA0-B356-38DCBDC6CB41}
+		{4F2E58B8-0D96-4E82-B728-43C317443584} = {DC9F9C67-40DD-4971-9C70-4338A65D2F2B}
 	EndGlobalSection
 EndGlobal

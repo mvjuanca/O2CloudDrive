@@ -8,7 +8,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>O2CloudDrive</AssemblyName>
-    <Version>0.8.4-juanca-test4</Version>
+    <Version>0.8.4-juanca-test6</Version>
     <RootNamespace>O2CloudDrive</RootNamespace>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ApplicationIcon>Assets\O2CloudDrive.ico</ApplicationIcon>

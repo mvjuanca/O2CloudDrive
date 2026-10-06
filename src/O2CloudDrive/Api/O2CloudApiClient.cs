@@ -16,7 +16,7 @@ public sealed record O2TransferProgress(
     long BytesPerSecond,
     string? Message);
 
-public sealed class O2CloudApiClient : IO2CloudApiClient
+public sealed class O2CloudApiClient : IO2CloudApiClient, IO2PhotoLibraryApi
 {
     private const int PageSize = 200;
     private const string PendingUploadIdPrefix = "pending:upload:";
@@ -793,6 +793,128 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         var result = new byte[total];
         Buffer.BlockCopy(buffer, 0, result, 0, total);
         return result;
+    }
+
+    public O2PhotoPage ListPhotoPage(int offset, int limit)
+    {
+        if (offset < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        }
+
+        if (limit is < 1 or > PageSize)
+        {
+            throw new ArgumentOutOfRangeException(nameof(limit), $"The page size must be between 1 and {PageSize}.");
+        }
+
+        using var document = SendJson(HttpMethod.Get, "media", new Dictionary<string, string?>
+        {
+            ["action"] = "get",
+            ["origin"] = "omh",
+            ["limit"] = limit.ToString(CultureInfo.InvariantCulture),
+            ["offset"] = offset.ToString(CultureInfo.InvariantCulture),
+        });
+
+        var root = document.RootElement;
+        var data = ObjectProperty(root, "data");
+        var media = FirstArray(data, "media", "pictures", "images", "items");
+        if (media.Count == 0)
+        {
+            media = FirstArray(root, "media", "pictures", "images", "items");
+        }
+
+        var photoEntries = new List<(string Id, string MediaType, DateTimeOffset? Date, long? Size)>();
+        foreach (var item in media)
+        {
+            var id = FirstMediaString(item, "id", "mediaid", "mediaId", "fdoid", "uuid");
+            var mediaType = FirstMediaString(item, "mediatype", "mediaType", "type", "kind") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(id) || !IsPictureMediaType(mediaType))
+            {
+                continue;
+            }
+
+            photoEntries.Add((
+                id,
+                mediaType,
+                FirstMediaDate(item, "date"),
+                FirstMediaLong(item, "size", "filesize", "fileSize", "contentlength", "contentLength")));
+        }
+
+        var details = LoadPhotoDetails(photoEntries.Select(entry => entry.Id));
+        var photos = new List<O2PhotoMetadata>(photoEntries.Count);
+        foreach (var entry in photoEntries)
+        {
+            details.TryGetValue(entry.Id, out var detail);
+            var hasDetail = detail.ValueKind == JsonValueKind.Object;
+            photos.Add(new O2PhotoMetadata(
+                entry.Id,
+                entry.MediaType,
+                entry.Date ?? (hasDetail ? FirstMediaDate(detail, "date") : null),
+                entry.Size ?? (hasDetail ? FirstMediaLong(detail, "size", "filesize", "fileSize", "contentlength", "contentLength") : null),
+                hasDetail ? FirstMediaString(detail, "name", "filename") : null,
+                hasDetail ? FirstMediaString(detail, "mimetype", "mimeType", "contenttype", "contentType") : null));
+        }
+
+        var hasMore = data.ValueKind == JsonValueKind.Object && data.TryGetProperty("more", out _)
+            ? BoolProperty(data, "more")
+            : BoolProperty(root, "more");
+        var nextOffset = checked(offset + media.Count);
+        return new O2PhotoPage(photos, nextOffset, hasMore);
+    }
+
+    private IReadOnlyDictionary<string, JsonElement> LoadPhotoDetails(IEnumerable<string> rawIds)
+    {
+        var ids = rawIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(PageSize)
+            .ToArray();
+        if (ids.Length == 0)
+        {
+            return new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        using var document = SendJson(
+            HttpMethod.Post,
+            "media",
+            new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+                ["origin"] = "omh,dropbox",
+            },
+            new
+            {
+                data = new
+                {
+                    ids = ids.Select(O2Id).ToArray(),
+                    fields = new[] { "name", "origin", "folderid", "size" },
+                },
+            });
+
+        var root = document.RootElement;
+        var data = ObjectProperty(root, "data");
+        var media = FirstArray(data, "media", "files", "pictures", "images", "items");
+        if (media.Count == 0)
+        {
+            media = FirstArray(root, "media", "files", "pictures", "images", "items");
+        }
+
+        var details = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in media)
+        {
+            foreach (var id in MediaIdCandidates(item))
+            {
+                details.TryAdd(id, item.Clone());
+            }
+        }
+
+        return details;
+    }
+
+    private static bool IsPictureMediaType(string mediaType)
+    {
+        return mediaType.Contains("picture", StringComparison.OrdinalIgnoreCase) ||
+               mediaType.Contains("image", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void TraceDownload(Uri uri, HttpStatusCode statusCode, ulong offset, uint length, int bytes)
