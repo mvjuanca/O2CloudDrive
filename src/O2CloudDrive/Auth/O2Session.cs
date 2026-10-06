@@ -7,6 +7,7 @@ public sealed record O2Session
     public string ValidationKey { get; init; } = string.Empty;
     public Dictionary<string, string> Cookies { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public string UserAgent { get; init; } = string.Empty;
+    public string DeviceId { get; init; } = string.Empty;
 
     [JsonIgnore]
     public bool IsAuthenticated => !string.IsNullOrWhiteSpace(ValidationKey);

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Security.Cryptography;
+using System.Net;
 using O2CloudDrive.Api;
 using O2CloudDrive.VirtualFileSystem;
 
@@ -244,6 +245,36 @@ Test("AA actual upload request creates without existing ID", () => {
     Check(handler.Checked, "actual multipart contract not inspected");
 });
 #endif
+#if CORE_ONLY
+Test("AC replacement preserves the primary HTTP failure, phase, and journal diagnostics", () => {
+    var api = new FakeApi();
+    var primary = new HttpRequestException("synthetic unauthorized response", null, HttpStatusCode.Unauthorized);
+    api.DownloadFailure = primary;
+    var journalDirectory = Path.Combine(root, "exception-preservation", Guid.NewGuid().ToString("N"));
+    using var content = new MemoryStream(next, writable: false);
+    RemoteReplacementException? replacement = null;
+    try
+    {
+        new RemoteFileReplacement(api, journalDirectory).Execute(null, "root", "failure-fixture.txt", content, next.LongLength);
+    }
+    catch (RemoteReplacementException error)
+    {
+        replacement = error;
+    }
+
+    Check(replacement is not null, "replacement exception was not surfaced");
+    Check(ReferenceEquals(replacement!.InnerException, primary), "primary exception identity/stack chain was replaced");
+    Check(replacement.FailedPhase == "verify-upload", "failed phase was not preserved");
+    Check(replacement.HttpStatusCode == (int)HttpStatusCode.Unauthorized, "HTTP status was not preserved");
+    Check(replacement.Operation.Contains("verify", StringComparison.OrdinalIgnoreCase), "logical operation was not preserved");
+    var journalPath = Directory.GetFiles(journalDirectory, "*.json").Single();
+    using var journal = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(journalPath));
+    var failure = journal.RootElement.GetProperty("failure");
+    Check(failure.GetProperty("phase").GetString() == "verify-upload", "journal lost original failure phase");
+    Check(failure.GetProperty("httpStatusCode").GetInt32() == (int)HttpStatusCode.Unauthorized, "journal lost status");
+    Check(!File.ReadAllText(journalPath).Contains("synthetic unauthorized response", StringComparison.Ordinal), "journal stored raw exception text");
+});
+#endif
 Console.WriteLine($"TOTAL {results.Count(x => x.Passed)}/{results.Count} PASS; isolated-cache={root}");
 return results.All(x => x.Passed) ? 0 : 1;
 
@@ -261,6 +292,9 @@ sealed class FakeApi : IO2CloudApiClient
     readonly Dictionary<string, (O2CloudItemDto Item, byte[] Bytes)> trash = new();
     readonly HashSet<string> failures = new();
     int serial; public int UploadCount;
+#if CORE_ONLY
+    public Exception? DownloadFailure;
+#endif
     public string CacheId { get; } = Guid.NewGuid().ToString("N");
     public bool CorruptUpload;
     public bool BlockUpload;
@@ -281,7 +315,12 @@ sealed class FakeApi : IO2CloudApiClient
     public O2ChangeSummary GetChangesSince(long from) => new(false, from, new HashSet<string>(), new HashSet<string>(), false);
     public IReadOnlyList<O2CloudItemDto> ListFolder(string id) { lock (gate) { if (UploadCount > 0) Maybe("confirm"); return files.Values.Select(x => x.Item).ToArray(); } }
     public IReadOnlyList<O2CloudItemDto> ListTrash() { lock (gate) return trash.Values.Select(x => x.Item).ToArray(); }
-    public byte[] DownloadFile(O2CloudItemDto item, ulong offset, uint length) { lock (gate) return files[item.Id].Bytes.Skip(checked((int)offset)).Take(checked((int)length)).ToArray(); }
+    public byte[] DownloadFile(O2CloudItemDto item, ulong offset, uint length) {
+#if CORE_ONLY
+        if (DownloadFailure is { } error) throw error;
+#endif
+        lock (gate) return files[item.Id].Bytes.Skip(checked((int)offset)).Take(checked((int)length)).ToArray();
+    }
     public string GetShareLink(O2CloudItemDto item) => "https://example.invalid/" + item.Id;
     public O2CloudItemDto CreateFolder(string parent, string name) => throw new NotSupportedException();
     public O2CloudItemDto UploadFile(string parent, string name, byte[] bytes) { using var stream = new MemoryStream(bytes); return UploadFile(parent, name, stream, bytes.Length); }
@@ -330,7 +369,7 @@ sealed class UploadInspector : HttpMessageHandler
 }
 sealed class FakeAuth : O2CloudDrive.Auth.IAuthService
 {
-    public O2CloudDrive.Auth.O2Session GetCurrentSession() => new() { ValidationKey = "FAKE-NOT-A-CREDENTIAL" };
+    public O2CloudDrive.Auth.O2Session GetCurrentSession() => new() { ValidationKey = "FAKE-NOT-A-CREDENTIAL", DeviceId = "FAKE_DEVICE" };
     public bool HasStoredSession() => false;
     public bool HasValidatedSession => true;
     public O2CloudDrive.Auth.O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false) => GetCurrentSession();

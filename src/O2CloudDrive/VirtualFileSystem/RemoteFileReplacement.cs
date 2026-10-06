@@ -1,4 +1,6 @@
 using System.Security.Cryptography;
+using System.Net;
+using System.Text;
 using System.Text.Json;
 using O2CloudDrive.Api;
 
@@ -16,6 +18,13 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
         var journal = Path.Combine(journalDirectory, token + ".json");
         string phase = "preflight";
         O2CloudItemDto? uploaded = null;
+        string? failedPhase = null;
+        string? failureOperation = null;
+        int? failureHttpStatusCode = null;
+        string? failureEndpoint = null;
+        string? failureResponseSummary = null;
+        string? failureExceptionType = null;
+        Exception? recoveryException = null;
         var hash = HashLocal(content, size);
         void Record(string nextPhase)
         {
@@ -26,6 +35,20 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
                 version = 1, time = DateTimeOffset.UtcNow, phase, parentId, name, size, hash,
                 oldId = original?.Id, newId = uploaded?.Id, temporary, backup,
                 localRetryPath = (content as FileStream)?.Name,
+                failure = failedPhase is null ? null : new
+                {
+                    phase = failedPhase,
+                    operation = failureOperation,
+                    httpStatusCode = failureHttpStatusCode,
+                    endpoint = failureEndpoint,
+                    responseSummary = failureResponseSummary,
+                    exceptionType = failureExceptionType,
+                },
+                recoveryFailure = recoveryException is null ? null : new
+                {
+                    phase = "rollback",
+                    exceptionType = recoveryException.GetType().Name,
+                },
             });
             Directory.CreateDirectory(journalDirectory);
             using (var output = new FileStream(journal + ".next", FileMode.Create, FileAccess.Write, FileShare.None))
@@ -62,12 +85,7 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
                 api.RenameOrMove(original, backup, parentId);
                 Require(parentId, original.Id, backup, original.Size);
             }
-            Record("promote");
-            api.RenameOrMove(uploaded, name, parentId);
-            var promoted = Require(parentId, uploaded.Id, name, size);
-            // Verify again before retiring the only old remote copy.
-            if (!HashRemote(promoted).Equals(hash, StringComparison.Ordinal))
-                throw new IOException("Promoted content verification failed.");
+            var promoted = PromoteVerifiedUpload(uploaded, temporary, parentId, name, size, hash, Record);
             if (original is not null)
             {
                 Record("retire-original");
@@ -80,7 +98,16 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
         }
         catch (Exception error)
         {
-            var failedPhase = phase;
+            failedPhase = phase;
+            var apiError = FindException<O2CloudApiException>(error);
+            var httpError = FindException<HttpRequestException>(error);
+            failureOperation = apiError?.Operation ?? OperationForPhase(failedPhase);
+            failureHttpStatusCode = apiError?.StatusCode is { } apiStatus
+                ? (int)apiStatus
+                : httpError?.StatusCode is { } httpStatus ? (int)httpStatus : null;
+            failureEndpoint = apiError?.Endpoint;
+            failureResponseSummary = apiError?.SanitizedResponseSummary;
+            failureExceptionType = error.GetType().Name;
             // A failed HTTP response can follow a successful server mutation.
             // Inspect actual IDs/names before any rollback; never delete a valid copy.
             bool recovered = false;
@@ -112,18 +139,80 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
                 recovered = true;
                 Record("rolled-back");
             }
-            catch
+            catch (Exception rollbackError)
             {
+                recoveryException = rollbackError;
                 // Preserve remote artifacts, local retry bytes and the durable journal.
                 try { Record("recovery-required"); } catch { /* earlier durable record remains */ }
             }
             Trace(recovered ? "failed-rolled-back" : "recovery-required", original?.Id, uploaded?.Id, name, size);
             throw new RemoteReplacementException(
-                $"O2 Cloud replacement failed ({failedPhase}); {(recovered ? "original preserved; retry possible" : "automatic retry blocked; recovery required")}. Journal: {journal}",
-                // HTTP/API exception bodies may contain credentials. Never log them via WinFsp.
-                new IOException($"Remote failure type: {error.GetType().Name}"), recoveryRequired: !recovered,
+                $"O2 Cloud replacement failed ({failedPhase}; {failureOperation}" +
+                (failureHttpStatusCode is null ? "" : $"; HTTP {failureHttpStatusCode}") +
+                $"); {(recovered ? "original preserved; retry possible" : "automatic retry blocked; recovery required")}. Journal: {journal}",
+                error,
+                failedPhase,
+                failureOperation,
+                failureHttpStatusCode,
+                failureEndpoint,
+                failureResponseSummary,
+                recoveryException,
+                recoveryRequired: !recovered,
                 recovered ? rollbackCurrent : liveNew?.Name == name ? liveNew : null);
         }
+    }
+
+    // Shared production promotion step. Recovery tooling may call this only after
+    // independently validating the existing journal and temporary object; it has
+    // no upload behavior and the same confirmation/hash checks as Execute().
+    internal O2CloudItemDto PromoteVerifiedUpload(
+        O2CloudItemDto uploaded,
+        string temporaryName,
+        string parentId,
+        string name,
+        long size,
+        string hash,
+        Action<string> recordPhase)
+    {
+        ArgumentNullException.ThrowIfNull(uploaded);
+        ArgumentNullException.ThrowIfNull(recordPhase);
+        if (uploaded.IsFolder || string.IsNullOrWhiteSpace(uploaded.Id) ||
+            uploaded.Size != size || size < 0 || string.IsNullOrWhiteSpace(hash))
+        {
+            throw new IOException("Verified upload metadata is incomplete; refusing promotion.");
+        }
+
+        var before = api.ListFolder(parentId);
+        var temporaryById = before.Where(item =>
+            string.Equals(item.Id, uploaded.Id, StringComparison.Ordinal)).ToArray();
+        var temporaryByName = before.Where(item =>
+            item.Name.Equals(temporaryName, StringComparison.Ordinal)).ToArray();
+        var targetByName = before.Where(item =>
+            item.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (temporaryById.Length != 1 || temporaryByName.Length != 1 ||
+            temporaryById[0].IsFolder || temporaryByName[0].IsFolder ||
+            temporaryById[0].Id != temporaryByName[0].Id ||
+            temporaryById[0].Size != size || targetByName.Length != 0)
+        {
+            throw new IOException("Promotion preflight did not confirm one exact temporary and an absent target.");
+        }
+
+        var currentTemporary = temporaryById[0];
+        if (!HashRemote(currentTemporary).Equals(hash, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("Promotion preflight content hash mismatch.");
+        }
+
+        // This durable phase record is written before the only mutating API call.
+        recordPhase("promote");
+        api.RenameOrMove(currentTemporary, name, parentId);
+        var promoted = Require(parentId, currentTemporary.Id, name, size);
+        if (!HashRemote(promoted).Equals(hash, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("Promoted content verification failed.");
+        }
+
+        return promoted;
     }
 
     private void EnsureNoUnfinishedTransaction(string parentId, string name)
@@ -186,16 +275,79 @@ internal sealed class RemoteFileReplacement(IO2CloudApiClient api, string journa
         return hash;
     }
 
+    private static TException? FindException<TException>(Exception? error) where TException : Exception
+    {
+        for (var current = error; current is not null; current = current.InnerException)
+        {
+            if (current is TException match) return match;
+        }
+
+        return null;
+    }
+
+    private static string OperationForPhase(string failedPhase) => failedPhase switch
+    {
+        "upload" => "upload",
+        "verify-upload" => "verify-upload-metadata-and-content",
+        "rename-original" => "rename-original-to-backup",
+        "promote" => "promote-uploaded-object",
+        "retire-original" => "move-original-to-trash",
+        _ => failedPhase,
+    };
+
     private static void Trace(string phase, string? oldId, string? newId, string name, long size)
     {
         if (Environment.GetEnvironmentVariable("O2CLOUD_TRACE_WRITES") == "1")
-            Console.Error.WriteLine(JsonSerializer.Serialize(new { time = DateTimeOffset.UtcNow, phase, name, oldId, newId, size }));
+        {
+            var nameHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(name)))[..12];
+            Console.Error.WriteLine(JsonSerializer.Serialize(new
+            {
+                time = DateTimeOffset.UtcNow,
+                phase,
+                nameHash,
+                oldId = MaskId(oldId),
+                newId = MaskId(newId),
+                size,
+            }));
+        }
     }
+
+    private static string? MaskId(string? value) => string.IsNullOrWhiteSpace(value)
+        ? null
+        : value.Length <= 8 ? "***" : value[..3] + "..." + value[^3..];
 }
 
-internal sealed class RemoteReplacementException(string message, Exception inner, bool recoveryRequired, O2CloudItemDto? currentItem)
-    : IOException(message, inner)
+internal sealed class RemoteReplacementException : IOException
 {
-    internal bool RecoveryRequired { get; } = recoveryRequired;
-    internal O2CloudItemDto? CurrentItem { get; } = currentItem;
+    internal RemoteReplacementException(
+        string message,
+        Exception inner,
+        string failedPhase,
+        string operation,
+        int? httpStatusCode,
+        string? endpoint,
+        string? sanitizedResponseSummary,
+        Exception? recoveryException,
+        bool recoveryRequired,
+        O2CloudItemDto? currentItem)
+        : base(message, inner)
+    {
+        FailedPhase = failedPhase;
+        Operation = operation;
+        HttpStatusCode = httpStatusCode;
+        Endpoint = endpoint;
+        SanitizedResponseSummary = sanitizedResponseSummary;
+        RecoveryException = recoveryException;
+        RecoveryRequired = recoveryRequired;
+        CurrentItem = currentItem;
+    }
+
+    internal string FailedPhase { get; }
+    internal string Operation { get; }
+    internal int? HttpStatusCode { get; }
+    internal string? Endpoint { get; }
+    internal string? SanitizedResponseSummary { get; }
+    internal Exception? RecoveryException { get; }
+    internal bool RecoveryRequired { get; }
+    internal O2CloudItemDto? CurrentItem { get; }
 }

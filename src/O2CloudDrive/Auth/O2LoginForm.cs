@@ -30,6 +30,7 @@ public sealed class O2LoginForm : Form
     private bool _webLoginAdvanceInFlight;
     private bool _webLoginAdvanceStarted;
     private string? _lastValidationKey;
+    private string? _lastDeviceId;
 
     public O2LoginForm(Uri loginUri, O2SessionValidator validator, string? userDataFolder = null, Action<string>? diagnosticLog = null)
     {
@@ -146,6 +147,20 @@ public sealed class O2LoginForm : Form
             };
             _webView.CoreWebView2.WebResourceResponseReceived += (_, args) =>
             {
+                if (args.Response.StatusCode is >= 200 and < 300 &&
+                    Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var apiUri) &&
+                    apiUri.Scheme == Uri.UriSchemeHttps &&
+                    apiUri.IdnHost.Equals("cloud.o2online.es", StringComparison.OrdinalIgnoreCase) &&
+                    apiUri.AbsolutePath.StartsWith("/sapi/", StringComparison.Ordinal) &&
+                    args.Request.Headers.Contains("X-Deviceid"))
+                {
+                    _lastDeviceId = args.Request.Headers.GetHeader("X-Deviceid");
+                    if (TryExtractValidationKey(args.Request.Uri, out var apiValidationKey))
+                    {
+                        _lastValidationKey = apiValidationKey;
+                    }
+                }
+
                 if (!string.Equals(args.Request.Method, "GET", StringComparison.OrdinalIgnoreCase) ||
                     !Uri.TryCreate(args.Request.Uri, UriKind.Absolute, out var responseUri) ||
                     !IsLoginHost(responseUri))
@@ -381,6 +396,7 @@ public sealed class O2LoginForm : Form
             ValidationKey = validationKey,
             Cookies = cookies,
             UserAgent = userAgent,
+            DeviceId = _lastDeviceId ?? string.Empty,
         };
     }
 

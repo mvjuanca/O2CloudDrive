@@ -92,7 +92,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     public O2CloudItemDto GetRootFolder()
     {
-        using var document = SendJson(HttpMethod.Post, "media/folder/root", new Dictionary<string, string?>
+        using var document = SendJson(HttpMethod.Get, "media/folder/root", new Dictionary<string, string?>
         {
             ["action"] = "get",
         });
@@ -736,7 +736,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             return [];
         }
 
-        response.EnsureSuccessStatusCode();
+        EnsureApiSuccess(request, response, "download-range");
         if (response.StatusCode != HttpStatusCode.PartialContent && offset > 0)
         {
             TraceDownload(uri, response.StatusCode, offset, length, 0);
@@ -894,7 +894,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         var useAsyncUpload = contentLength > AsyncUploadThresholdBytes;
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildUploadUri(useAsyncUpload));
         ApplySessionHeaders(request);
-        request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
         request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
         request.Headers.TryAddWithoutValidation("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
         request.Headers.TryAddWithoutValidation("Referer", _baseUri.GetLeftPart(UriPartial.Authority) + "/");
@@ -944,10 +943,9 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         using var response = SendUploadRequest(request, uploadCancellation.Token);
         stallTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
         {
-            throw new UnauthorizedAccessException("O2 Cloud rechazo la subida porque la sesion no esta autorizada.");
+            throw O2CloudApiException.FromResponse(request, response, "upload");
         }
 
         if (useAsyncUpload &&
@@ -966,20 +964,20 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                 return confirmedAfterTimeout;
             }
 
-            throw new IOException(
-                "O2 Cloud ha recibido la subida en modo asincrono, pero el archivo todavia no aparece confirmado en la carpeta remota.");
+            throw O2CloudApiException.FromResponse(request, response, "async-upload-confirmation");
         }
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new IOException($"O2 Cloud rechazo la subida HTTP {(int)response.StatusCode}: {TrimPreview(text)}");
+            throw O2CloudApiException.FromResponse(request, response, "upload");
         }
 
+        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         ReportTransfer("confirming", name, contentLength, contentLength);
         JsonDocument? document;
         try
         {
-            document = ParseOptionalJson(text);
+            document = ParseOptionalJson(text, request, response, "upload-response");
         }
         catch (JsonException ex)
         {
@@ -997,10 +995,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                     return listedAfterAcceptedText;
                 }
 
-                throw new IOException("O2 Cloud acepto la subida, pero el archivo no aparece confirmado en el listado remoto.");
+                throw O2CloudApiException.FromApplicationError(request, response, "upload-confirmation", text, ex);
             }
 
-            throw new IOException($"O2 Cloud devolvio una respuesta de subida no reconocida: {TrimPreview(text)}", ex);
+            throw O2CloudApiException.FromApplicationError(request, response, "upload-response-parse", text, ex);
         }
 
         using (document)
@@ -2062,12 +2060,17 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         {
             request.Content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
         }
+        else if (method == HttpMethod.Get)
+        {
+            request.Content = new ByteArrayContent([]);
+            request.Content.Headers.TryAddWithoutValidation("Content-Type", "application/x-www-form-urlencoded");
+        }
 
         using var response = _httpClient.Send(request);
-        response.EnsureSuccessStatusCode();
+        EnsureApiSuccess(request, response, "SAPI request");
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         var document = ParseJson(text);
-        ThrowIfO2Error(document.RootElement, text);
+        ThrowIfO2Error(document.RootElement, text, request, response, "SAPI request");
         return document;
     }
 
@@ -2085,9 +2088,9 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         ]);
 
         using var response = _httpClient.Send(request);
-        response.EnsureSuccessStatusCode();
+        EnsureApiSuccess(request, response, "SAPI form request");
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        return ParseOptionalJson(text);
+        return ParseOptionalJson(text, request, response, "SAPI form request");
     }
 
     private Uri BuildAuthenticatedUri(string resource, IReadOnlyDictionary<string, string?> query)
@@ -2132,6 +2135,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     private void ApplySessionHeaders(HttpRequestMessage request)
     {
         var session = _authService.GetCurrentSession();
+        O2SessionRequestIdentity.ApplyDeviceIdHeader(request, session);
         if (!string.IsNullOrWhiteSpace(session.CookieHeader))
         {
             request.Headers.TryAddWithoutValidation("Cookie", session.CookieHeader);
@@ -2140,10 +2144,20 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         request.Headers.TryAddWithoutValidation(
             "User-Agent",
             string.IsNullOrWhiteSpace(session.UserAgent) ? "O2CloudDrive/0.1" : session.UserAgent);
-        request.Headers.TryAddWithoutValidation("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
+        if (request.Method != HttpMethod.Get)
+        {
+            request.Headers.TryAddWithoutValidation("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
+        }
         request.Headers.TryAddWithoutValidation("Referer", _baseUri.GetLeftPart(UriPartial.Authority) + "/");
         request.Headers.TryAddWithoutValidation("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
-        request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
+    }
+
+    private static void EnsureApiSuccess(HttpRequestMessage request, HttpResponseMessage response, string operation)
+    {
+        if (!response.IsSuccessStatusCode)
+        {
+            throw O2CloudApiException.FromResponse(request, response, operation);
+        }
     }
 
     private string NormalizeShareLink(string rawUrl)
@@ -2304,7 +2318,11 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         return value;
     }
 
-    private static JsonDocument? ParseOptionalJson(string text)
+    private static JsonDocument? ParseOptionalJson(
+        string text,
+        HttpRequestMessage request,
+        HttpResponseMessage response,
+        string operation)
     {
         var trimmed = text.Trim();
         if (string.IsNullOrWhiteSpace(trimmed) ||
@@ -2316,7 +2334,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
 
         var document = ParseJson(trimmed);
-        ThrowIfO2Error(document.RootElement, trimmed);
+        ThrowIfO2Error(document.RootElement, trimmed, request, response, operation);
         return document;
     }
 
@@ -3037,7 +3055,12 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             : id;
     }
 
-    private static void ThrowIfO2Error(JsonElement root, string rawText)
+    private static void ThrowIfO2Error(
+        JsonElement root,
+        string rawText,
+        HttpRequestMessage request,
+        HttpResponseMessage response,
+        string operation)
     {
         if (root.ValueKind != JsonValueKind.Object)
         {
@@ -3046,13 +3069,13 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         if (root.TryGetProperty("error", out var error) && IsMeaningfulError(error))
         {
-            throw new InvalidOperationException($"O2 Cloud devolvio error: {TrimPreview(error.ToString())}");
+            throw O2CloudApiException.FromApplicationError(request, response, operation, rawText);
         }
 
         var success = FirstString(root, "success");
         if (success is not null && success.Equals("false", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException($"O2 Cloud rechazo la operacion: {TrimPreview(rawText)}");
+            throw O2CloudApiException.FromApplicationError(request, response, operation, rawText);
         }
 
         var status = FirstString(root, "status");
@@ -3060,7 +3083,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             (status.Contains("error", StringComparison.OrdinalIgnoreCase) ||
              status.Contains("fail", StringComparison.OrdinalIgnoreCase)))
         {
-            throw new InvalidOperationException($"O2 Cloud rechazo la operacion: {TrimPreview(rawText)}");
+            throw O2CloudApiException.FromApplicationError(request, response, operation, rawText);
         }
     }
 
@@ -3171,12 +3194,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     {
         var normalized = value.Trim().ToUpperInvariant();
         return normalized is "0" or "OK" or "SUCCESS" or "TRUE" or "COM-0000" or "COM-0";
-    }
-
-    private static string TrimPreview(string value)
-    {
-        var compact = value.ReplaceLineEndings(" ").Trim();
-        return compact.Length <= 240 ? compact : compact[..240] + "...";
     }
 
     private static T FirstSuccess<T>(params Func<T>[] operations)

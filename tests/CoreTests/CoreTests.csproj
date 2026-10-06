@@ -10,6 +10,7 @@
     <Compile Include="../OverwriteTests/Program.cs" Link="Program.cs" />
     <Compile Include="../../src/O2CloudDrive/Api/IO2CloudApiClient.cs" Link="Api/IO2CloudApiClient.cs" />
     <Compile Include="../../src/O2CloudDrive/Api/O2CloudItemDto.cs" Link="Api/O2CloudItemDto.cs" />
+    <Compile Include="../../src/O2CloudDrive/Api/O2CloudApiException.cs" Link="Api/O2CloudApiException.cs" />
     <Compile Include="../../src/O2CloudDrive/VirtualFileSystem/*.cs"
              Exclude="../../src/O2CloudDrive/VirtualFileSystem/O2VirtualFileSystem.cs"
              Link="Store/%(Filename)%(Extension)" />

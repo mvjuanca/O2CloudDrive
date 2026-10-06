@@ -1,5 +1,6 @@
 using O2CloudDrive.Auth;
 using System.Net;
+using System.Net.Http.Headers;
 
 var passed = 0;
 var failed = 0;
@@ -37,76 +38,196 @@ var unsafeUrl = "https://t3.o2online.es/acceso/#/accessUserPassO2?state=state-se
 var safeUrl = O2LoginFlowPolicy.SanitizeUri(unsafeUrl);
 Test("diagnostic route redacts dynamic query and hash values", safeUrl.Contains("#/accessUserPassO2?[redacted]", StringComparison.Ordinal) && !safeUrl.Contains("state-secret", StringComparison.Ordinal) && !safeUrl.Contains("session-secret", StringComparison.Ordinal));
 
-var exceptionLog = SafeHttpTraceHandler.FormatExceptionChain(new HttpRequestException(
-    "Request failed at https://cloud.o2online.es/sapi/media?action=get&validationkey=QUERY_SECRET&phone=PHONE_SECRET",
-    new IOException("pin=PIN_SECRET password=PASSWORD_SECRET"), HttpStatusCode.Forbidden));
-Test("HTTP exception chain includes status/type but redacts URL and credential values",
-    exceptionLog.Contains("HttpRequestException", StringComparison.Ordinal) &&
-    exceptionLog.Contains("Forbidden", StringComparison.Ordinal) &&
-    exceptionLog.Contains("IOException", StringComparison.Ordinal) &&
-    !exceptionLog.Contains("QUERY_SECRET", StringComparison.Ordinal) &&
-    !exceptionLog.Contains("PHONE_SECRET", StringComparison.Ordinal) &&
-    !exceptionLog.Contains("PIN_SECRET", StringComparison.Ordinal) &&
-    !exceptionLog.Contains("PASSWORD_SECRET", StringComparison.Ordinal));
-
-var traceLines = new List<string>();
-var traceCookies = new CookieContainer();
-using (var traceHandler = new SafeHttpTraceHandler(traceLines.Add, () => "test", () => new O2Session
+var identitySession = new O2Session { ValidationKey = "OFFLINE_VALIDATION", DeviceId = "OFFLINE_SESSION_DEVICE" };
+using (var identityRequest = new HttpRequestMessage(HttpMethod.Get, "https://cloud.o2online.es/sapi/media"))
 {
-    ValidationKey = "SESSION_SECRET",
-    UserAgent = "SafeTest/1.0",
-    Cookies = new Dictionary<string, string> { ["sid"] = "COOKIE_SECRET" },
-}, traceCookies) { InnerHandler = new FixedResponseHandler() })
-using (var traceClient = new HttpClient(traceHandler))
-using (var traceRequest = new HttpRequestMessage(HttpMethod.Get,
-           "https://cloud.o2online.es/sapi/media?action=get-storage-space&validationkey=QUERY_SECRET"))
-{
-    traceRequest.Headers.TryAddWithoutValidation("Cookie", "sid=COOKIE_SECRET");
-    traceRequest.Headers.TryAddWithoutValidation("User-Agent", "SafeTest/1.0");
-    using var traceResponse = traceClient.SendAsync(traceRequest).GetAwaiter().GetResult();
-    using var syncRequest = new HttpRequestMessage(HttpMethod.Get,
-        "https://cloud.o2online.es/sapi/profile/role?action=get&validationkey=QUERY_SECRET");
-    syncRequest.Headers.TryAddWithoutValidation("Cookie", "sid=COOKIE_SECRET");
-    syncRequest.Headers.TryAddWithoutValidation("User-Agent", "SafeTest/1.0");
-    using var syncResponse = traceClient.Send(syncRequest);
+    identityRequest.Headers.TryAddWithoutValidation("X-Deviceid", "STALE_TEST_VALUE");
+    O2SessionRequestIdentity.ApplyDeviceIdHeader(identityRequest, identitySession);
+    var values = identityRequest.Headers.GetValues(O2SessionRequestIdentity.HeaderName).ToArray();
+    Test("authenticated SAPI request uses only the session DeviceId",
+        values.Length == 1 && values[0] == identitySession.DeviceId &&
+        !identityRequest.Headers.Contains("Authorization"));
 }
-var traceOutput = string.Join('\n', traceLines);
-Test("HTTP diagnostics report endpoint/status/header presence without sensitive values",
-    traceOutput.Contains("method=GET", StringComparison.Ordinal) &&
-    traceOutput.Contains("/sapi/media", StringComparison.Ordinal) &&
-    traceOutput.Contains("validationkey_present=True", StringComparison.Ordinal) &&
-    traceOutput.Contains("cookie_header_present=True", StringComparison.Ordinal) &&
-    traceOutput.Contains("status=403", StringComparison.Ordinal) &&
-    traceLines.Count(line => line.StartsWith("HTTP_REQUEST ", StringComparison.Ordinal)) == 2 &&
-    traceLines.Count(line => line.StartsWith("HTTP_RESPONSE ", StringComparison.Ordinal)) == 2 &&
-    traceOutput.Contains("content_type=application/json", StringComparison.Ordinal) &&
-    !traceOutput.Contains("SESSION_SECRET", StringComparison.Ordinal) &&
-    !traceOutput.Contains("COOKIE_SECRET", StringComparison.Ordinal) &&
-    !traceOutput.Contains("QUERY_SECRET", StringComparison.Ordinal));
 
-var runner = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures", "RealValidation.Program.cs"));
-Test("human login runner has no fixed 90-second close", !runner.Contains("90000", StringComparison.Ordinal) && !runner.Contains("System.Windows.Forms.Timer", StringComparison.Ordinal));
+using (var missingIdentityRequest = new HttpRequestMessage(HttpMethod.Get, "https://cloud.o2online.es/sapi/media"))
+{
+    var rejected = false;
+    try { O2SessionRequestIdentity.ApplyDeviceIdHeader(missingIdentityRequest, identitySession with { DeviceId = "" }); }
+    catch (InvalidOperationException) { rejected = true; }
+    Test("missing session DeviceId is rejected before a request is sent",
+        rejected && !missingIdentityRequest.Headers.Contains(O2SessionRequestIdentity.HeaderName));
+}
+
+using (var unauthenticatedRequest = new HttpRequestMessage(HttpMethod.Get, "https://cloud.o2online.es/sapi/media"))
+{
+    var rejected = false;
+    try { O2SessionRequestIdentity.ApplyDeviceIdHeader(unauthenticatedRequest, identitySession with { ValidationKey = "" }); }
+    catch (InvalidOperationException) { rejected = true; }
+    Test("unauthenticated session cannot apply a DeviceId header",
+        rejected && !unauthenticatedRequest.Headers.Contains(O2SessionRequestIdentity.HeaderName));
+}
+
+bool ValidateResponse(HttpStatusCode statusCode, string mediaType, string body)
+{
+    using var handler = new ValidatorResponseHandler(statusCode, mediaType, body);
+    using var client = new HttpClient(handler);
+    var validator = new O2SessionValidator(client, "https://cloud.o2online.es/sapi/");
+    return validator.Validate(new O2Session
+    {
+        ValidationKey = "TEST_KEY_NOT_REAL",
+        UserAgent = "SafeTest/1.0",
+        DeviceId = "TEST_DEVICE_NOT_REAL",
+        Cookies = new Dictionary<string, string> { ["sid"] = "TEST_COOKIE_NOT_REAL" },
+    });
+}
+
+Test("strict validator rejects 200 JavaScript", !ValidateResponse(HttpStatusCode.OK, "text/javascript", "window.status='ok';"));
+Test("strict validator rejects 200 HTML", !ValidateResponse(HttpStatusCode.OK, "text/html", "<html><body>O2</body></html>"));
+Test("strict validator rejects 401", !ValidateResponse(HttpStatusCode.Unauthorized, "application/json", "{\"data\":{\"used\":2,\"free\":8}}"));
+Test("strict validator rejects JSON error without quota evidence", !ValidateResponse(HttpStatusCode.OK, "application/json", "{\"error\":{\"code\":401,\"message\":\"unauthorized\"}}"));
+Test("strict validator rejects JSON error even when quota fields are present", !ValidateResponse(HttpStatusCode.OK, "application/json", "{\"error\":\"unauthorized\",\"data\":{\"used\":2,\"free\":8}}"));
+Test("strict validator accepts JSON with used and free storage fields", ValidateResponse(HttpStatusCode.OK, "application/json", "{\"data\":{\"usedspace\":2,\"freespace\":8}}"));
+Test("strict validator accepts text/javascript when it contains valid quota JSON", ValidateResponse(HttpStatusCode.OK, "text/javascript", "{\"data\":{\"usedspace\":2,\"freespace\":8}}"));
+Test("strict validator rejects text/javascript with unrelated JSON", !ValidateResponse(HttpStatusCode.OK, "text/javascript", "{\"data\":{\"message\":\"ok\"}}"));
+
+var diagnosticSession = new O2Session
+{
+    ValidationKey = "VALIDATION_SECRET",
+    DeviceId = "DEVICE_SECRET",
+    UserAgent = "SafeDiagnostic/1.0",
+    Cookies = new Dictionary<string, string> { ["sid"] = "COOKIE_SECRET" },
+};
+var successDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "text/javascript",
+    "{\"data\":{\"usedspace\":12,\"freespace\":88}}", diagnosticSession);
+var successSummary = successDiagnostic.Result.ToSafeSummary();
+Test("diagnostic pass records method endpoint status MIME length and positive JSON shape",
+    successDiagnostic.Result.IsValid && successDiagnostic.Result.Condition == "positive_storage_shape" &&
+    successDiagnostic.Result.Method == "GET" && successDiagnostic.Result.Endpoint == "https://cloud.o2online.es/sapi/media" &&
+    successDiagnostic.Result.HttpStatus == 200 && successDiagnostic.Result.MimeType == "text/javascript" &&
+    successDiagnostic.Result.ResponseLengthBytes == System.Text.Encoding.UTF8.GetByteCount("{\"data\":{\"usedspace\":12,\"freespace\":88}}") &&
+    successDiagnostic.Result.ResponseSummary.Contains("used_numeric=true", StringComparison.Ordinal) &&
+    successDiagnostic.Result.HttpSendAttempted && successDiagnostic.Result.DeviceIdHeaderMatchesSession &&
+    successDiagnostic.RequestCount == 1);
+Test("safe validation diagnostics omit validation key cookie device ID and response values",
+    !successSummary.Contains("VALIDATION_SECRET", StringComparison.Ordinal) &&
+    !successSummary.Contains("COOKIE_SECRET", StringComparison.Ordinal) &&
+    !successSummary.Contains("DEVICE_SECRET", StringComparison.Ordinal) &&
+    !successSummary.Contains("usedspace\\\":12", StringComparison.Ordinal));
+
+var deniedDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.Unauthorized, "text/html",
+    "<html>LOGIN_BODY_SECRET</html>", diagnosticSession);
+Test("diagnostic identifies 401 before MIME rejection and summarizes markup without content",
+    !deniedDiagnostic.Result.IsValid && deniedDiagnostic.Result.Condition == "http_status_not_success" &&
+    deniedDiagnostic.Result.HttpStatus == 401 && deniedDiagnostic.Result.MimeType == "text/html" &&
+    deniedDiagnostic.Result.ResponseSummary == "html_or_markup_non_json" &&
+    !deniedDiagnostic.Result.ToSafeSummary().Contains("LOGIN_BODY_SECRET", StringComparison.Ordinal));
+
+var unrelatedDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "text/javascript",
+    "{\"data\":{\"message\":\"BODY_VALUE_SECRET\"}}", diagnosticSession);
+Test("diagnostic pinpoints missing positive storage fields without exposing JSON values",
+    !unrelatedDiagnostic.Result.IsValid &&
+    unrelatedDiagnostic.Result.Condition == "storage_used_field_missing_or_non_numeric" &&
+    !unrelatedDiagnostic.Result.ToSafeSummary().Contains("BODY_VALUE_SECRET", StringComparison.Ordinal));
+
+var mimeDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "text/html", "<html>not-json</html>", diagnosticSession);
+Test("diagnostic pinpoints unexpected MIME separately from HTTP success",
+    !mimeDiagnostic.Result.IsValid && mimeDiagnostic.Result.Condition == "response_mime_not_json" &&
+    mimeDiagnostic.Result.HttpStatus == 200);
+
+var invalidJsonDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "application/json", "{broken-secretless", diagnosticSession);
+Test("diagnostic identifies invalid JSON structure",
+    !invalidJsonDiagnostic.Result.IsValid && invalidJsonDiagnostic.Result.Condition == "response_body_invalid_json" &&
+    invalidJsonDiagnostic.Result.ResponseSummary == "non_json_text");
+
+var missingIdentityHandler = new DiagnosticValidatorHandler(HttpStatusCode.OK, "application/json", "{\"data\":{\"used\":1,\"free\":2}}");
+using (var missingIdentityHttp = new HttpClient(missingIdentityHandler))
+{
+    var missingIdentityResult = new O2SessionValidator(missingIdentityHttp, "https://cloud.o2online.es/sapi/")
+        .ValidateDetailed(diagnosticSession with { DeviceId = "" });
+    Test("diagnostic explains missing DeviceId before HTTP without a request",
+        !missingIdentityResult.IsValid && missingIdentityResult.Condition == "device_id_missing" &&
+        !missingIdentityResult.HttpSendAttempted && missingIdentityHandler.RequestCount == 0);
+}
+
+var exceptionDiagnostic = DiagnosticValidationFixtures.ValidateDetailedException(diagnosticSession);
+var exceptionSummary = exceptionDiagnostic.ToSafeSummary();
+Test("diagnostic captures primary and inner exception types while omitting their messages",
+    exceptionDiagnostic.Condition == "http_send_exception" &&
+    exceptionDiagnostic.PrimaryExceptionType == nameof(HttpRequestException) &&
+    exceptionDiagnostic.InnerExceptionType == nameof(IOException) &&
+    !exceptionSummary.Contains("EXCEPTION_MESSAGE_SECRET", StringComparison.Ordinal) &&
+    !exceptionSummary.Contains("VALIDATION_SECRET", StringComparison.Ordinal) &&
+    !exceptionSummary.Contains("COOKIE_SECRET", StringComparison.Ordinal));
 
 Console.WriteLine($"Login flow tests: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 
-sealed class FixedResponseHandler : HttpMessageHandler
+sealed class ValidatorResponseHandler(HttpStatusCode statusCode, string mediaType, string body) : HttpMessageHandler
 {
-    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken) => MakeResponse(request);
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken) => MakeResponse();
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(MakeResponse());
+
+    private HttpResponseMessage MakeResponse() => new(statusCode)
     {
-        return Task.FromResult(MakeResponse(request));
+        Content = new StringContent(body)
+        {
+            Headers = { ContentType = new MediaTypeHeaderValue(mediaType) },
+        },
+    };
+}
+
+static class DiagnosticValidationFixtures
+{
+    public static (O2SessionValidationDiagnostic Result, int RequestCount) ValidateDetailedResponse(
+        HttpStatusCode statusCode, string mediaType, string body, O2Session session)
+    {
+        using var handler = new DiagnosticValidatorHandler(statusCode, mediaType, body);
+        using var http = new HttpClient(handler);
+        var result = new O2SessionValidator(http, "https://cloud.o2online.es/sapi/").ValidateDetailed(session);
+        return (result, handler.RequestCount);
     }
 
-    private static HttpResponseMessage MakeResponse(HttpRequestMessage request)
+    public static O2SessionValidationDiagnostic ValidateDetailedException(O2Session session)
     {
-        var response = new HttpResponseMessage(HttpStatusCode.Forbidden)
+        using var handler = new DiagnosticValidatorHandler(new HttpRequestException(
+            "EXCEPTION_MESSAGE_SECRET", new IOException("COOKIE_SECRET")));
+        using var http = new HttpClient(handler);
+        return new O2SessionValidator(http, "https://cloud.o2online.es/sapi/").ValidateDetailed(session);
+    }
+}
+
+sealed class DiagnosticValidatorHandler : HttpMessageHandler
+{
+    private readonly HttpStatusCode? _statusCode;
+    private readonly string? _mediaType;
+    private readonly string? _body;
+    private readonly Exception? _exception;
+    public int RequestCount { get; private set; }
+
+    public DiagnosticValidatorHandler(HttpStatusCode statusCode, string mediaType, string body)
+    {
+        _statusCode = statusCode;
+        _mediaType = mediaType;
+        _body = body;
+    }
+
+    public DiagnosticValidatorHandler(Exception exception) => _exception = exception;
+
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        RequestCount++;
+        if (_exception is not null) throw _exception;
+        var response = new HttpResponseMessage(_statusCode!.Value)
         {
-            ReasonPhrase = "Forbidden",
-            Content = new StringContent("{\"error\":\"redacted-test-body\"}", System.Text.Encoding.UTF8, "application/json"),
+            Content = new StringContent(_body!, System.Text.Encoding.UTF8),
             RequestMessage = request,
         };
+        response.Content.Headers.ContentType = new MediaTypeHeaderValue(_mediaType!);
         return response;
     }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(Send(request, cancellationToken));
 }

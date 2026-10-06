@@ -7,8 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../src/O2CloudDrive/Auth/O2LoginFlowPolicy.cs" Link="O2LoginFlowPolicy.cs" />
+    <Compile Include="../../src/O2CloudDrive/Auth/O2SessionValidator.cs" Link="O2SessionValidator.cs" />
     <Compile Include="../../src/O2CloudDrive/Auth/O2Session.cs" Link="O2Session.cs" />
-    <Compile Include="../RealValidation/SafeHttpTraceHandler.cs" Link="SafeHttpTraceHandler.cs" />
-    <None Include="../RealValidation/Program.cs" Link="Fixtures/RealValidation.Program.cs" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../../src/O2CloudDrive/Auth/O2SessionRequestIdentity.cs" Link="O2SessionRequestIdentity.cs" />
   </ItemGroup>
 </Project>

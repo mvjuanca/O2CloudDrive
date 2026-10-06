@@ -484,6 +484,7 @@ internal static class Program
         builder.Query = string.Join("&", parameters);
 
         using var request = new HttpRequestMessage(method, builder.Uri);
+        O2CloudDrive.Auth.O2SessionRequestIdentity.ApplyDeviceIdHeader(request, session);
         if (!string.IsNullOrWhiteSpace(session.CookieHeader))
         {
             request.Headers.TryAddWithoutValidation("Cookie", session.CookieHeader);
