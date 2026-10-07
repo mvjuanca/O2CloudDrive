@@ -6,8 +6,29 @@ public interface IAuthService
     bool HasStoredSession();
     bool HasValidatedSession { get; }
     O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false);
+    StoredSessionValidationResult ValidateStoredSession(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnsureAuthenticated(allowInteractive: false) is { IsAuthenticated: true }
+            ? new StoredSessionValidationResult(StoredSessionValidationStatus.Valid, "validated", SessionValidationClassification.Accepted)
+            : new StoredSessionValidationResult(StoredSessionValidationStatus.Missing, "no_stored_session", SessionValidationClassification.MissingSession);
+    }
     void Logout();
 }
+
+public enum StoredSessionValidationStatus
+{
+    Missing,
+    Valid,
+    Rejected,
+    Unavailable,
+}
+
+public sealed record StoredSessionValidationResult(
+    StoredSessionValidationStatus Status,
+    string Condition,
+    SessionValidationClassification Classification,
+    O2SessionValidationDiagnostic? Diagnostic = null);
 
 public sealed class AuthService : IAuthService
 {
@@ -16,6 +37,7 @@ public sealed class AuthService : IAuthService
     private readonly IInteractiveLoginService _loginService;
     private readonly O2SessionValidator _validator;
     private O2Session? _currentSession;
+    private StoredSessionValidationResult? _lastTerminalStoredValidation;
 
     public AuthService(
         ISessionStore sessionStore,
@@ -41,37 +63,88 @@ public sealed class AuthService : IAuthService
 
     public bool HasValidatedSession => _currentSession is { IsAuthenticated: true };
 
+    public StoredSessionValidationResult ValidateStoredSession(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_lastTerminalStoredValidation is not null)
+        {
+            return _lastTerminalStoredValidation;
+        }
+
+        var storedSession = _sessionStore.TryRead();
+        if (storedSession is null)
+        {
+            _currentSession = null;
+            return _lastTerminalStoredValidation = new StoredSessionValidationResult(
+                StoredSessionValidationStatus.Missing, "no_stored_session", SessionValidationClassification.MissingSession);
+        }
+
+        var diagnostic = _validator.ValidateDetailed(storedSession, cancellationToken, storedSession: true);
+        if (diagnostic.Classification == SessionValidationClassification.Accepted)
+        {
+            _currentSession = storedSession;
+            return _lastTerminalStoredValidation = new StoredSessionValidationResult(
+                StoredSessionValidationStatus.Valid, diagnostic.Condition, diagnostic.Classification, diagnostic);
+        }
+
+        _currentSession = null;
+        var isRejected = diagnostic.Classification is
+            SessionValidationClassification.Unauthorized401 or
+            SessionValidationClassification.Forbidden403 or
+            SessionValidationClassification.MissingValidationKey or
+            SessionValidationClassification.MissingDeviceId;
+        var status = isRejected ? StoredSessionValidationStatus.Rejected : StoredSessionValidationStatus.Unavailable;
+        var result = new StoredSessionValidationResult(status, diagnostic.Condition, diagnostic.Classification, diagnostic);
+
+        // Keep the stored credential for diagnosis. Do not repeat a terminal rejection in this process.
+        if (diagnostic.Classification is not (SessionValidationClassification.TransientNetworkFailure or SessionValidationClassification.Timeout))
+        {
+            _lastTerminalStoredValidation = result;
+        }
+
+        return result;
+    }
+
     public O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false)
     {
         if (!forceInteractive)
         {
             var environmentSession = TryEnvironmentSession();
-            if (Validate(environmentSession))
+            if (environmentSession is not null)
             {
-                _currentSession = environmentSession;
-                return _currentSession;
-            }
-            else if (environmentSession is not null)
-            {
-                ClearEnvironmentSession();
+                var environmentDiagnostic = _validator.ValidateDetailed(environmentSession);
+                if (environmentDiagnostic.IsValid)
+                {
+                    _currentSession = environmentSession;
+                    return _currentSession;
+                }
+
+                if (environmentDiagnostic.Classification is SessionValidationClassification.Unauthorized401 or
+                    SessionValidationClassification.Forbidden403 or SessionValidationClassification.MissingValidationKey or
+                    SessionValidationClassification.MissingDeviceId)
+                {
+                    ClearEnvironmentSession();
+                }
+                else
+                {
+                    return null;
+                }
             }
 
-            var storedSession = _sessionStore.TryRead();
-            if (Validate(storedSession))
+            var storedResult = ValidateStoredSession();
+            if (storedResult.Status == StoredSessionValidationStatus.Valid)
             {
-                _currentSession = storedSession;
                 return _currentSession;
             }
 
-            if (storedSession is not null)
+            if (storedResult.Status == StoredSessionValidationStatus.Unavailable)
             {
-                _sessionStore.Delete();
+                return null;
             }
         }
         else
         {
             _currentSession = null;
-            _sessionStore.Delete();
             ClearEnvironmentSession();
         }
 
@@ -88,6 +161,7 @@ public sealed class AuthService : IAuthService
 
         _currentSession = capturedSession;
         _sessionStore.Save(capturedSession!);
+        _lastTerminalStoredValidation = null;
         return _currentSession;
     }
 
@@ -95,13 +169,10 @@ public sealed class AuthService : IAuthService
     {
         _currentSession = null;
         _sessionStore.Delete();
+        _lastTerminalStoredValidation = new StoredSessionValidationResult(
+            StoredSessionValidationStatus.Missing, "explicit_logout", SessionValidationClassification.MissingSession);
         ClearEnvironmentSession();
         _loginService.ClearSessionCache();
-    }
-
-    private bool Validate(O2Session? session)
-    {
-        return session is { IsAuthenticated: true } && _validator.Validate(session);
     }
 
     private static O2Session? TryEnvironmentSession()

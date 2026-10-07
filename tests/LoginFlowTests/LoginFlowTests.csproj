@@ -7,6 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../src/O2CloudDrive/Auth/O2LoginFlowPolicy.cs" Link="O2LoginFlowPolicy.cs" />
+    <Compile Include="../../src/O2CloudDrive/Auth/AuthSessionLog.cs" Link="AuthSessionLog.cs" />
+    <Compile Include="../../src/O2CloudDrive/Auth/AuthSessionDiagnosticsHandler.cs" Link="AuthSessionDiagnosticsHandler.cs" />
     <Compile Include="../../src/O2CloudDrive/Auth/O2SessionValidator.cs" Link="O2SessionValidator.cs" />
     <Compile Include="../../src/O2CloudDrive/Auth/O2Session.cs" Link="O2Session.cs" />
     <Compile Include="../../src/O2CloudDrive/Auth/O2SessionRequestIdentity.cs" Link="O2SessionRequestIdentity.cs" />

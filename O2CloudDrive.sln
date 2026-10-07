@@ -11,6 +11,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "O2CloudDrive", "src\O2Cloud
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PhotoLibraryTests", "tests\PhotoLibraryTests\PhotoLibraryTests.csproj", "{4F2E58B8-0D96-4E82-B728-43C317443584}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StartupTests", "tests\StartupTests\StartupTests.csproj", "{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -28,9 +30,14 @@ Global
 		{4F2E58B8-0D96-4E82-B728-43C317443584}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4F2E58B8-0D96-4E82-B728-43C317443584}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4F2E58B8-0D96-4E82-B728-43C317443584}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{9315D03C-61FF-44E5-B338-E9AD0BCB6929} = {64934C86-C500-4AA0-B356-38DCBDC6CB41}
 		{4F2E58B8-0D96-4E82-B728-43C317443584} = {DC9F9C67-40DD-4971-9C70-4338A65D2F2B}
+		{7BAA7419-9B5B-4A70-9A76-AB6A48FD2F11} = {DC9F9C67-40DD-4971-9C70-4338A65D2F2B}
 	EndGlobalSection
 EndGlobal

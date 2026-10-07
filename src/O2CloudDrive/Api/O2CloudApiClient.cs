@@ -2272,6 +2272,14 @@ public sealed class O2CloudApiClient : IO2CloudApiClient, IO2PhotoLibraryApi
         }
         request.Headers.TryAddWithoutValidation("Referer", _baseUri.GetLeftPart(UriPartial.Authority) + "/");
         request.Headers.TryAddWithoutValidation("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
+        request.Options.Set(AuthSessionDiagnosticsHandler.RequestContextKey, new AuthenticatedRequestContext(
+            AuthSessionLog.CreateLogicalOperation(request.Method, request.RequestUri),
+            SessionPresent: session.IsAuthenticated,
+            StoredSessionExists: null,
+            ValidationKeyPresent: !string.IsNullOrWhiteSpace(session.ValidationKey),
+            DeviceIdPresent: !string.IsNullOrWhiteSpace(session.DeviceId),
+            CookieCount: session.Cookies.Count(pair => !string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value)),
+            UserAgentPresent: !string.IsNullOrWhiteSpace(session.UserAgent)));
     }
 
     private static void EnsureApiSuccess(HttpRequestMessage request, HttpResponseMessage response, string operation)

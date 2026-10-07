@@ -17,6 +17,7 @@ public sealed record AppConfig
     public bool IncludePrereleaseUpdates { get; init; } = true;
     public bool UseSimulatedData { get; init; }
     public bool RequireAuthentication { get; init; } = true;
+    public bool AutoMountOnStartup { get; init; } = true;
     public int? RunForSeconds { get; init; }
     public bool SelfTest { get; init; }
     public bool ApiProbe { get; init; }

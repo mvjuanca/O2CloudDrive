@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace O2CloudDrive.Auth;
@@ -9,17 +10,22 @@ namespace O2CloudDrive.Auth;
 /// </summary>
 public sealed class O2SessionValidator
 {
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(12);
     private static readonly string[] UsedNames = ["used", "usedspace", "storageused"];
     private static readonly string[] FreeNames = ["free", "freespace", "storagefree"];
     private static readonly string[] TotalNames = ["total", "totalspace", "quota", "capacity", "storagetotal"];
 
     private readonly HttpClient _httpClient;
     private readonly Uri _baseUri;
+    private readonly AuthSessionLog? _authSessionLog;
+    private readonly TimeSpan _requestTimeout;
 
-    public O2SessionValidator(HttpClient httpClient, string apiBaseUrl)
+    public O2SessionValidator(HttpClient httpClient, string apiBaseUrl, AuthSessionLog? authSessionLog = null, TimeSpan? requestTimeout = null)
     {
         _httpClient = httpClient;
         _baseUri = new Uri(apiBaseUrl, UriKind.Absolute);
+        _authSessionLog = authSessionLog;
+        _requestTimeout = requestTimeout ?? RequestTimeout;
     }
 
     public bool Validate(O2Session session)
@@ -29,9 +35,14 @@ public sealed class O2SessionValidator
     /// Performs the same single read-only storage probe as Validate, but returns
     /// structural diagnostics that never contain request or response values.
     /// </summary>
-    public O2SessionValidationDiagnostic ValidateDetailed(O2Session session)
+    public O2SessionValidationDiagnostic ValidateDetailed(
+        O2Session session,
+        CancellationToken cancellationToken = default,
+        bool storedSession = false)
     {
         ArgumentNullException.ThrowIfNull(session);
+        var started = Stopwatch.GetTimestamp();
+        var setCookies = SetCookieMetadataSummary.Empty;
         const string operation = "authenticated-storage-quota-probe";
         const string method = "GET";
         var endpoint = SafeEndpoint(new Uri(_baseUri, "media"));
@@ -41,18 +52,29 @@ public sealed class O2SessionValidator
         var cookieHeaderPresent = !string.IsNullOrWhiteSpace(session.CookieHeader);
         var userAgentPresent = !string.IsNullOrWhiteSpace(session.UserAgent);
 
+        O2SessionValidationDiagnostic Complete(O2SessionValidationDiagnostic diagnostic)
+        {
+            var completed = diagnostic with
+            {
+                DurationMilliseconds = Math.Round(Stopwatch.GetElapsedTime(started).TotalMilliseconds, 1),
+                SetCookies = setCookies,
+            };
+            _authSessionLog?.LogValidation(completed, storedSession, session);
+            return completed;
+        }
+
         if (!session.IsAuthenticated)
         {
-            return new O2SessionValidationDiagnostic(false, "validation_key_missing", operation, method, endpoint,
+            return Complete(new O2SessionValidationDiagnostic(false, "validation_key_missing", operation, method, endpoint,
                 null, "none", null, "not_requested", false, validationKeyPresent,
-                cookieHeaderPresent, cookieCount, userAgentPresent, false, null, null, null, null);
+                cookieHeaderPresent, cookieCount, userAgentPresent, false, null, null, null, null));
         }
 
         if (string.IsNullOrWhiteSpace(session.DeviceId))
         {
-            return new O2SessionValidationDiagnostic(false, "device_id_missing", operation, method, endpoint,
+            return Complete(new O2SessionValidationDiagnostic(false, "device_id_missing", operation, method, endpoint,
                 null, "none", null, "not_requested", false, validationKeyPresent,
-                cookieHeaderPresent, cookieCount, userAgentPresent, false, null, null, null, null);
+                cookieHeaderPresent, cookieCount, userAgentPresent, false, null, null, null, null));
         }
 
         HttpRequestMessage request;
@@ -64,32 +86,48 @@ public sealed class O2SessionValidator
             request.Headers.Accept.ParseAdd("application/json");
             request.Content = new ByteArrayContent([]);
             request.Content.Headers.TryAddWithoutValidation("Content-Type", "application/x-www-form-urlencoded");
+            request.Options.Set(AuthSessionDiagnosticsHandler.RequestContextKey, new AuthenticatedRequestContext(
+                operation, true, storedSession, validationKeyPresent, !string.IsNullOrWhiteSpace(session.DeviceId),
+                cookieCount, userAgentPresent, IsSessionValidation: true));
             deviceIdHeaderMatchesSession = request.Headers.TryGetValues(O2SessionRequestIdentity.HeaderName, out var deviceValues) &&
                 deviceValues.Count() == 1 && string.Equals(deviceValues.Single(), session.DeviceId, StringComparison.Ordinal);
         }
         catch (Exception exception)
         {
-            return DiagnosticFailure("request_build_exception", endpoint, null, "none", null, "not_sent",
+            return Complete(DiagnosticFailure("request_build_exception", endpoint, null, "none", null, "not_sent",
                 false, validationKeyPresent, cookieHeaderPresent, cookieCount, userAgentPresent,
-                false, exception, null, null);
+                false, exception, null, null));
         }
 
         using (request)
         {
+        using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(_requestTimeout);
         HttpResponseMessage response;
         try
         {
-            response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead);
+            response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead, requestTimeout.Token);
         }
         catch (Exception exception)
         {
-            return DiagnosticFailure("http_send_exception", endpoint, null, "none", null, "not_received",
+            var failureCondition = exception switch
+            {
+                OperationCanceledException when !cancellationToken.IsCancellationRequested => "timeout",
+                OperationCanceledException => "cancelled",
+                HttpRequestException => "network_failure",
+                _ => "other_failure",
+            };
+            return Complete(DiagnosticFailure(failureCondition, endpoint, null, "none", null, "not_received",
                 true, validationKeyPresent, cookieHeaderPresent, cookieCount, userAgentPresent,
-                deviceIdHeaderMatchesSession, exception, null, null);
+                deviceIdHeaderMatchesSession, exception, null, null));
         }
 
         using (response)
         {
+            if (!request.Options.TryGetValue(AuthSessionDiagnosticsHandler.ResponseSetCookiesKey, out setCookies))
+            {
+                setCookies = AuthSessionLog.CaptureSetCookies(response.Headers);
+            }
             var status = (int)response.StatusCode;
             var mimeType = response.Content.Headers.ContentType?.MediaType ?? "none";
             var responseEndpoint = response.RequestMessage?.RequestUri is { } responseUri
@@ -98,13 +136,18 @@ public sealed class O2SessionValidator
             byte[] body;
             try
             {
-                body = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                body = response.Content.ReadAsByteArrayAsync(requestTimeout.Token).GetAwaiter().GetResult();
             }
             catch (Exception exception)
             {
-                return DiagnosticFailure("response_body_read_exception", responseEndpoint, status, mimeType, null,
+                var failureCondition = exception is OperationCanceledException && !cancellationToken.IsCancellationRequested
+                    ? "timeout"
+                    : exception is OperationCanceledException
+                        ? "cancelled"
+                        : "response_body_read_failure";
+                return Complete(DiagnosticFailure(failureCondition, responseEndpoint, status, mimeType, null,
                     "unreadable", true, validationKeyPresent, cookieHeaderPresent, cookieCount, userAgentPresent,
-                    deviceIdHeaderMatchesSession, exception, status, null);
+                    deviceIdHeaderMatchesSession, exception, status, null));
             }
 
             var text = DecodeResponseBody(body, response.Content.Headers.ContentType?.CharSet);
@@ -115,10 +158,10 @@ public sealed class O2SessionValidator
                     ? "response_mime_not_json"
                     : shape.Condition;
 
-            return new O2SessionValidationDiagnostic(shape.IsPositive && response.IsSuccessStatusCode && IsJsonMimeType(mimeType),
+            return Complete(new O2SessionValidationDiagnostic(shape.IsPositive && response.IsSuccessStatusCode && IsJsonMimeType(mimeType),
                 condition, operation, method, responseEndpoint, status, mimeType, body.LongLength, shape.Summary,
                 true, validationKeyPresent, cookieHeaderPresent, cookieCount, userAgentPresent,
-                deviceIdHeaderMatchesSession, null, null, null, null);
+                deviceIdHeaderMatchesSession, null, null, null, null));
         }
         }
     }
@@ -347,8 +390,37 @@ public sealed record O2SessionValidationDiagnostic(
     string? HttpRequestError,
     int? ExceptionStatusCode)
 {
+    public double DurationMilliseconds { get; init; }
+    public SetCookieMetadataSummary SetCookies { get; init; } = SetCookieMetadataSummary.Empty;
+
+    public SessionValidationClassification Classification
+    {
+        get
+        {
+            if (IsValid) return SessionValidationClassification.Accepted;
+            if (Condition == "validation_key_missing") return SessionValidationClassification.MissingValidationKey;
+            if (Condition == "device_id_missing") return SessionValidationClassification.MissingDeviceId;
+            if (HttpStatus == (int)System.Net.HttpStatusCode.Unauthorized) return SessionValidationClassification.Unauthorized401;
+            if (HttpStatus == (int)System.Net.HttpStatusCode.Forbidden) return SessionValidationClassification.Forbidden403;
+            if (Condition == "timeout") return SessionValidationClassification.Timeout;
+            if (Condition == "network_failure" ||
+                HttpRequestError is not null ||
+                PrimaryExceptionType == nameof(HttpRequestException) ||
+                HttpStatus is 408 or 429 || HttpStatus is >= 500)
+                return SessionValidationClassification.TransientNetworkFailure;
+            if (HttpStatus is int status && (status < 200 || status >= 300))
+                return SessionValidationClassification.UnexpectedHttpStatus;
+            if (HttpStatus is >= 200 and < 300 || Condition.StartsWith("response_", StringComparison.Ordinal) ||
+                Condition.StartsWith("storage_", StringComparison.Ordinal) || Condition.StartsWith("json_", StringComparison.Ordinal) ||
+                Condition == "explicit_api_failure")
+                return SessionValidationClassification.InvalidResponse;
+            return SessionValidationClassification.OtherFailure;
+        }
+    }
+
     public string ToSafeSummary() =>
         "valid=" + IsValid +
+        " classification=" + Classification +
         " condition=" + Condition +
         " operation=" + Operation +
         " method=" + Method +
@@ -356,6 +428,9 @@ public sealed record O2SessionValidationDiagnostic(
         " status=" + (HttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none") +
         " mime=" + MimeType +
         " response_bytes=" + (ResponseLengthBytes?.ToString(CultureInfo.InvariantCulture) ?? "unknown") +
+        " duration_ms=" + DurationMilliseconds.ToString(CultureInfo.InvariantCulture) +
+        " set_cookie_present=" + SetCookies.Present +
+        " set_cookie_count=" + SetCookies.Count +
         " body_summary=" + ResponseSummary +
         " http_send_attempted=" + HttpSendAttempted +
         " validationkey_present=" + ValidationKeyPresent +
@@ -368,4 +443,19 @@ public sealed record O2SessionValidationDiagnostic(
         " http_request_error=" + (HttpRequestError ?? "none") +
         " exception_status=" + (ExceptionStatusCode?.ToString(CultureInfo.InvariantCulture) ?? "none") +
         " secret_values_omitted=true";
+}
+
+public enum SessionValidationClassification
+{
+    Accepted,
+    Unauthorized401,
+    Forbidden403,
+    MissingValidationKey,
+    MissingDeviceId,
+    TransientNetworkFailure,
+    Timeout,
+    UnexpectedHttpStatus,
+    InvalidResponse,
+    OtherFailure,
+    MissingSession,
 }

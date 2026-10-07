@@ -116,11 +116,23 @@ Test("safe validation diagnostics omit validation key cookie device ID and respo
 
 var deniedDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.Unauthorized, "text/html",
     "<html>LOGIN_BODY_SECRET</html>", diagnosticSession);
-Test("diagnostic identifies 401 before MIME rejection and summarizes markup without content",
+Test("diagnostic classifies 401 before MIME rejection and summarizes markup without content",
     !deniedDiagnostic.Result.IsValid && deniedDiagnostic.Result.Condition == "http_status_not_success" &&
+    deniedDiagnostic.Result.Classification == SessionValidationClassification.Unauthorized401 &&
     deniedDiagnostic.Result.HttpStatus == 401 && deniedDiagnostic.Result.MimeType == "text/html" &&
     deniedDiagnostic.Result.ResponseSummary == "html_or_markup_non_json" &&
     !deniedDiagnostic.Result.ToSafeSummary().Contains("LOGIN_BODY_SECRET", StringComparison.Ordinal));
+
+var forbiddenDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.Forbidden, "application/json", "{}", diagnosticSession).Result;
+Test("diagnostic distinguishes HTTP 403", forbiddenDiagnostic.Classification == SessionValidationClassification.Forbidden403);
+
+var transientDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.ServiceUnavailable, "text/plain", "busy", diagnosticSession).Result;
+Test("diagnostic classifies retryable server status as transient network failure",
+    transientDiagnostic.Classification == SessionValidationClassification.TransientNetworkFailure);
+
+var unexpectedStatusDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.NotFound, "text/plain", "missing", diagnosticSession).Result;
+Test("diagnostic distinguishes an unexpected non-transient HTTP status",
+    unexpectedStatusDiagnostic.Classification == SessionValidationClassification.UnexpectedHttpStatus);
 
 var unrelatedDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "text/javascript",
     "{\"data\":{\"message\":\"BODY_VALUE_SECRET\"}}", diagnosticSession);
@@ -132,7 +144,8 @@ Test("diagnostic pinpoints missing positive storage fields without exposing JSON
 var mimeDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "text/html", "<html>not-json</html>", diagnosticSession);
 Test("diagnostic pinpoints unexpected MIME separately from HTTP success",
     !mimeDiagnostic.Result.IsValid && mimeDiagnostic.Result.Condition == "response_mime_not_json" &&
-    mimeDiagnostic.Result.HttpStatus == 200);
+    mimeDiagnostic.Result.HttpStatus == 200 &&
+    mimeDiagnostic.Result.Classification == SessionValidationClassification.InvalidResponse);
 
 var invalidJsonDiagnostic = DiagnosticValidationFixtures.ValidateDetailedResponse(HttpStatusCode.OK, "application/json", "{broken-secretless", diagnosticSession);
 Test("diagnostic identifies invalid JSON structure",
@@ -152,12 +165,81 @@ using (var missingIdentityHttp = new HttpClient(missingIdentityHandler))
 var exceptionDiagnostic = DiagnosticValidationFixtures.ValidateDetailedException(diagnosticSession);
 var exceptionSummary = exceptionDiagnostic.ToSafeSummary();
 Test("diagnostic captures primary and inner exception types while omitting their messages",
-    exceptionDiagnostic.Condition == "http_send_exception" &&
+    exceptionDiagnostic.Condition == "network_failure" &&
+    exceptionDiagnostic.Classification == SessionValidationClassification.TransientNetworkFailure &&
     exceptionDiagnostic.PrimaryExceptionType == nameof(HttpRequestException) &&
     exceptionDiagnostic.InnerExceptionType == nameof(IOException) &&
     !exceptionSummary.Contains("EXCEPTION_MESSAGE_SECRET", StringComparison.Ordinal) &&
     !exceptionSummary.Contains("VALIDATION_SECRET", StringComparison.Ordinal) &&
     !exceptionSummary.Contains("COOKIE_SECRET", StringComparison.Ordinal));
+
+var temporaryLogRoot = Path.Combine(Path.GetTempPath(), "O2AuthSessionTests-" + Guid.NewGuid().ToString("N"));
+var authLogPath = Path.Combine(temporaryLogRoot, "Logs", "auth-session.log");
+try
+{
+    var authLog = new AuthSessionLog(authLogPath);
+    const string setCookieSecret = "SET_COOKIE_VALUE_SECRET";
+    const string responseBodySecret = "RESPONSE_BODY_SECRET";
+    var loggedValidation = DiagnosticValidationFixtures.ValidateDetailedResponse(
+        HttpStatusCode.Unauthorized,
+        "text/html",
+        "<html>" + responseBodySecret + "</html>",
+        diagnosticSession,
+        authLog,
+        storedSession: true,
+        setCookie: $"sid={setCookieSecret}; Domain=.o2online.es; Path=/sapi; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
+
+    var webViewProfile = Path.Combine(temporaryLogRoot, "WebView2");
+    Directory.CreateDirectory(webViewProfile);
+    authLog.LogWebViewProfileState(webViewProfile, existedBeforeLogin: true);
+    authLog.LogWebViewCookieMetadata(new[]
+    {
+        new WebViewCookieMetadata("websid", ".o2online.es", "/", true, true, false,
+            new DateTimeOffset(2030, 1, 2, 3, 4, 5, TimeSpan.Zero)),
+    }, persistedCookieCount: 1);
+
+    var apiResponseHandler = new DiagnosticValidatorHandler(HttpStatusCode.OK, "application/json", "{}",
+        $"apiCookie={setCookieSecret}; Domain=.o2online.es; Path=/; HttpOnly");
+    using (var apiHttp = new HttpClient(new AuthSessionDiagnosticsHandler(apiResponseHandler, authLog)))
+    using (var apiRequest = new HttpRequestMessage(HttpMethod.Get, "https://cloud.o2online.es/sapi/profile/role?action=get"))
+    {
+        apiRequest.Options.Set(AuthSessionDiagnosticsHandler.RequestContextKey, new AuthenticatedRequestContext(
+            "GET https://cloud.o2online.es/sapi/profile", true, null, true, true, 1, true));
+        using var apiResponse = apiHttp.Send(apiRequest);
+    }
+
+    var authLogText = File.ReadAllText(authLogPath);
+    Test("persistent auth log records detailed classification and stored-session presence",
+        authLogText.Contains("session_validation", StringComparison.Ordinal) &&
+        authLogText.Contains("Unauthorized401", StringComparison.Ordinal) &&
+        authLogText.Contains("\"status\":401", StringComparison.Ordinal) &&
+        authLogText.Contains("\"storedSessionExists\":true", StringComparison.Ordinal) &&
+        loggedValidation.Result.SetCookies.Present);
+    Test("Set-Cookie metadata is recorded without cookie values or response body",
+        authLogText.Contains("sid", StringComparison.Ordinal) &&
+        authLogText.Contains(".o2online.es", StringComparison.Ordinal) &&
+        authLogText.Contains("/sapi", StringComparison.Ordinal) &&
+        authLogText.Contains("3600", StringComparison.Ordinal) &&
+        !authLogText.Contains(setCookieSecret, StringComparison.Ordinal) &&
+        !authLogText.Contains(responseBodySecret, StringComparison.Ordinal) &&
+        !authLogText.Contains("VALIDATION_SECRET", StringComparison.Ordinal) &&
+        !authLogText.Contains("COOKIE_SECRET", StringComparison.Ordinal) &&
+        !authLogText.Contains("DEVICE_SECRET", StringComparison.Ordinal));
+    Test("authenticated API Set-Cookie response is instrumented with metadata only",
+        authLogText.Contains("authenticated_api_response", StringComparison.Ordinal) &&
+        authLogText.Contains("apiCookie", StringComparison.Ordinal) &&
+        !authLogText.Contains(setCookieSecret, StringComparison.Ordinal));
+    Test("WebView profile and cookie expiry/security metadata are logged without values",
+        authLogText.Contains("webview_profile", StringComparison.Ordinal) &&
+        authLogText.Contains("profileFoundBeforeLogin", StringComparison.Ordinal) &&
+        authLogText.Contains("webViewCookieCount", StringComparison.Ordinal) &&
+        authLogText.Contains("httpOnly", StringComparison.Ordinal) &&
+        authLogText.Contains("expiresUtc", StringComparison.Ordinal));
+}
+finally
+{
+    if (Directory.Exists(temporaryLogRoot)) Directory.Delete(temporaryLogRoot, recursive: true);
+}
 
 Console.WriteLine($"Login flow tests: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
@@ -181,11 +263,18 @@ sealed class ValidatorResponseHandler(HttpStatusCode statusCode, string mediaTyp
 static class DiagnosticValidationFixtures
 {
     public static (O2SessionValidationDiagnostic Result, int RequestCount) ValidateDetailedResponse(
-        HttpStatusCode statusCode, string mediaType, string body, O2Session session)
+        HttpStatusCode statusCode,
+        string mediaType,
+        string body,
+        O2Session session,
+        AuthSessionLog? authSessionLog = null,
+        bool storedSession = false,
+        string? setCookie = null)
     {
-        using var handler = new DiagnosticValidatorHandler(statusCode, mediaType, body);
+        using var handler = new DiagnosticValidatorHandler(statusCode, mediaType, body, setCookie);
         using var http = new HttpClient(handler);
-        var result = new O2SessionValidator(http, "https://cloud.o2online.es/sapi/").ValidateDetailed(session);
+        var result = new O2SessionValidator(http, "https://cloud.o2online.es/sapi/", authSessionLog)
+            .ValidateDetailed(session, storedSession: storedSession);
         return (result, handler.RequestCount);
     }
 
@@ -203,14 +292,16 @@ sealed class DiagnosticValidatorHandler : HttpMessageHandler
     private readonly HttpStatusCode? _statusCode;
     private readonly string? _mediaType;
     private readonly string? _body;
+    private readonly string? _setCookie;
     private readonly Exception? _exception;
     public int RequestCount { get; private set; }
 
-    public DiagnosticValidatorHandler(HttpStatusCode statusCode, string mediaType, string body)
+    public DiagnosticValidatorHandler(HttpStatusCode statusCode, string mediaType, string body, string? setCookie = null)
     {
         _statusCode = statusCode;
         _mediaType = mediaType;
         _body = body;
+        _setCookie = setCookie;
     }
 
     public DiagnosticValidatorHandler(Exception exception) => _exception = exception;
@@ -225,6 +316,7 @@ sealed class DiagnosticValidatorHandler : HttpMessageHandler
             RequestMessage = request,
         };
         response.Content.Headers.ContentType = new MediaTypeHeaderValue(_mediaType!);
+        if (_setCookie is not null) response.Headers.TryAddWithoutValidation("Set-Cookie", _setCookie);
         return response;
     }
 

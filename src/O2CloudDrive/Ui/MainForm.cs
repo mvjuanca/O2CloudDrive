@@ -1,13 +1,22 @@
 using System.Diagnostics;
 using O2CloudDrive.Api;
+using O2CloudDrive.Auth;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
+using O2CloudDrive.Startup;
 using O2CloudDrive.Updates;
 
 namespace O2CloudDrive.Ui;
 
 public sealed class MainForm : Form
 {
+    private static readonly TimeSpan[] StartupValidationRetryDelays =
+    [
+        TimeSpan.FromSeconds(2),
+        TimeSpan.FromSeconds(4),
+        TimeSpan.FromSeconds(8),
+        TimeSpan.FromSeconds(15),
+    ];
     private static readonly Color AppBackColor = Color.FromArgb(229, 235, 241);
     private static readonly Color SurfaceColor = Color.FromArgb(248, 250, 252);
     private static readonly Color SidebarColor = Color.FromArgb(38, 43, 49);
@@ -23,6 +32,7 @@ public sealed class MainForm : Form
     private static readonly Color DangerColor = Color.FromArgb(193, 62, 48);
 
     private readonly O2DriveAppServices _services;
+    private readonly AutoMountCoordinator _autoMountCoordinator = new();
     private readonly ComboBox _driveComboBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 120 };
     private readonly TextBox _volumeLabelTextBox = new() { Width = 320 };
     private readonly CheckBox _forceLoginCheckBox = new() { AutoSize = true };
@@ -765,7 +775,7 @@ public sealed class MainForm : Form
 
     private async Task LoginAsync()
     {
-        await RunUiActionAsync("auth:login:start", async () =>
+        var loginSucceeded = await RunUiActionAsync("auth:login:start", async () =>
         {
             var session = _services.AuthService.EnsureAuthenticated(allowInteractive: true, forceInteractive: true);
             if (session is not { IsAuthenticated: true })
@@ -776,6 +786,12 @@ public sealed class MainForm : Form
             await Task.CompletedTask;
             return "auth:login:ok";
         });
+
+        if (loginSucceeded && _services.AuthService.HasValidatedSession)
+        {
+            _autoMountCoordinator.ResetForNewSession();
+            await TryAutoMountAsync();
+        }
     }
 
     private async Task ValidateStoredSessionOnStartupAsync()
@@ -788,22 +804,65 @@ public sealed class MainForm : Form
             return;
         }
 
+        _busy = true;
+        SetControlsEnabled(false);
+        var shouldAutoMount = false;
         try
         {
-            var session = await Task.Run(() => _services.AuthService.EnsureAuthenticated(allowInteractive: false));
-            if (!IsDisposed)
+            for (var attempt = 0; attempt <= StartupValidationRetryDelays.Length; attempt++)
             {
-                UpdateState(session is { IsAuthenticated: true }
-                    ? "auth:stored-session:ok"
-                    : "auth:stored-session:expired");
+                var result = await Task.Run(
+                    () => _services.AuthService.ValidateStoredSession(_updateCheckCancellation.Token),
+                    _updateCheckCancellation.Token);
+                if (IsDisposed || _updateCheckCancellation.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                switch (result.Classification)
+                {
+                    case SessionValidationClassification.Accepted:
+                        UpdateState("auth:stored-session:ok");
+                        shouldAutoMount = true;
+                        break;
+                    case SessionValidationClassification.MissingSession:
+                        UpdateState("auth:stored-session:missing");
+                        break;
+                    case SessionValidationClassification.TransientNetworkFailure or SessionValidationClassification.Timeout
+                        when attempt < StartupValidationRetryDelays.Length:
+                        UpdateState("auth:stored-session:retrying");
+                        await Task.Delay(StartupValidationRetryDelays[attempt], _updateCheckCancellation.Token);
+                        continue;
+                    default:
+                        UpdateState("auth:stored-session:" + result.Classification);
+                        break;
+                }
+
+                break;
             }
+        }
+        catch (OperationCanceledException) when (_updateCheckCancellation.IsCancellationRequested)
+        {
         }
         catch
         {
             if (!IsDisposed)
             {
-                UpdateState("auth:stored-session:expired");
+                UpdateState("auth:stored-session:unavailable");
             }
+        }
+        finally
+        {
+            _busy = false;
+            if (!IsDisposed)
+            {
+                UpdateState(_lastStatus, appendLog: false);
+            }
+        }
+
+        if (shouldAutoMount && !IsDisposed && _services.Config.AutoMountOnStartup)
+        {
+            await TryAutoMountAsync();
         }
     }
 
@@ -819,27 +878,72 @@ public sealed class MainForm : Form
         var volumeLabel = _volumeLabelTextBox.Text.Trim();
         await RunUiActionAsync($"mount:start {mountPoint}", async () =>
         {
-            if (!_services.Config.UseSimulatedData && _services.Config.RequireAuthentication)
+            return await MountCoreAsync(
+                mountPoint,
+                volumeLabel,
+                allowInteractive: true,
+                forceInteractive: _forceLoginCheckBox.Checked,
+                sessionAlreadyValidated: false);
+        });
+    }
+
+    private async Task TryAutoMountAsync()
+    {
+        var mountPoint = NormalizeMountPoint(_services.Config.MountPoint);
+        var result = await _autoMountCoordinator.TryMountAsync(
+            _services.Config.AutoMountOnStartup,
+            _services.AuthService.HasValidatedSession,
+            _services.MountService.IsMounted,
+            async () => await RunUiActionAsync($"mount:auto:start {mountPoint}", () => MountCoreAsync(
+                mountPoint,
+                _services.Config.VolumeLabel,
+                allowInteractive: false,
+                forceInteractive: false,
+                sessionAlreadyValidated: true)));
+
+        if (result.Status == AutoMountStatus.Failed && result.ErrorType is not null && !_busy && !IsDisposed)
+        {
+            // RunUiActionAsync has already shown the concrete mount error and kept the app alive.
+            AppendLog($"mount:auto:failed {result.ErrorType}");
+        }
+    }
+
+    private async Task<string> MountCoreAsync(
+        string mountPoint,
+        string volumeLabel,
+        bool allowInteractive,
+        bool forceInteractive,
+        bool sessionAlreadyValidated)
+    {
+        if (!_services.Config.UseSimulatedData && _services.Config.RequireAuthentication)
+        {
+            if (sessionAlreadyValidated)
             {
-                var session = _services.AuthService.EnsureAuthenticated(
-                    allowInteractive: true,
-                    forceInteractive: _forceLoginCheckBox.Checked);
-                if (session is not { IsAuthenticated: true })
+                if (!_services.AuthService.HasValidatedSession)
                 {
-                    throw new InvalidOperationException("No hay una sesion valida de O2 Cloud.");
+                    throw new InvalidOperationException("La sesion guardada ya no esta validada; no se montara la unidad.");
                 }
             }
-
-            var options = new DriveMountOptions(mountPoint, volumeLabel, _services.Config.UseSimulatedData);
-            await Task.Run(() => _services.MountService.Mount(options));
-            _notifyIcon.ShowBalloonTip(1500, "O2 Cloud Drive", $"Unidad montada en {mountPoint}", ToolTipIcon.Info);
-            if (!_services.Config.UseSimulatedData && _services.MountService.LastRootItemCount == 0)
+            else
             {
-                return $"mount:ok-empty-root {mountPoint}";
+                var session = _services.AuthService.EnsureAuthenticated(allowInteractive, forceInteractive);
+                if (session is not { IsAuthenticated: true })
+                {
+                    var message = _services.AuthService.HasStoredSession()
+                        ? "O2 no pudo validar la sesion guardada. Se conserva localmente; comprueba la red y vuelve a intentarlo."
+                        : "No hay una sesion valida de O2 Cloud.";
+                    throw new InvalidOperationException(message);
+                }
             }
+        }
 
-            return $"mount:ok {mountPoint}";
-        });
+        var options = new DriveMountOptions(mountPoint, volumeLabel, _services.Config.UseSimulatedData);
+        await Task.Run(() => _services.MountService.Mount(options));
+        _notifyIcon.ShowBalloonTip(1500, "O2 Cloud Drive", $"Unidad montada en {mountPoint}", ToolTipIcon.Info);
+        var prefix = sessionAlreadyValidated ? "mount:auto" : "mount";
+        return !_services.Config.UseSimulatedData && _services.MountService.LastRootItemCount == 0
+            ? $"{prefix}:ok-empty-root {mountPoint}"
+            : $"{prefix}:ok {mountPoint}";
     }
 
     private async Task UnmountAsync()
@@ -861,7 +965,7 @@ public sealed class MainForm : Form
 
     private async Task LogoutAsync()
     {
-        await RunUiActionAsync("auth:logout:start", async () =>
+        var logoutSucceeded = await RunUiActionAsync("auth:logout:start", async () =>
         {
             if (_services.MountService.IsMounted)
             {
@@ -872,6 +976,11 @@ public sealed class MainForm : Form
             _forceLoginCheckBox.Checked = false;
             return "auth:logout:ok";
         });
+
+        if (logoutSucceeded)
+        {
+            _autoMountCoordinator.ResetForNewSession();
+        }
     }
 
     private async Task ExitAsync()
@@ -1059,11 +1168,11 @@ public sealed class MainForm : Form
         await ExitAsync();
     }
 
-    private async Task RunUiActionAsync(string pendingStatus, Func<Task<string>> action)
+    private async Task<bool> RunUiActionAsync(string pendingStatus, Func<Task<string>> action)
     {
         if (_busy)
         {
-            return;
+            return false;
         }
 
         _busy = true;
@@ -1073,11 +1182,13 @@ public sealed class MainForm : Form
             SetControlsEnabled(false);
             var message = await action();
             UpdateState(message);
+            return true;
         }
         catch (Exception ex)
         {
             UpdateState($"error:{ex.GetType().Name}");
             MessageBox.Show(this, ex.Message, "O2 Cloud Drive", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
         }
         finally
         {
@@ -1297,6 +1408,11 @@ public sealed class MainForm : Form
             return $"Montaje: validando sesion y creando la unidad {message["mount:start ".Length..]}.";
         }
 
+        if (message.StartsWith("mount:auto:start ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Auto-montaje: creando la unidad configurada {message["mount:auto:start ".Length..]}.";
+        }
+
         if (message.StartsWith("mount:ok-empty-root ", StringComparison.OrdinalIgnoreCase))
         {
             return $"Montaje: unidad {message["mount:ok-empty-root ".Length..]} creada, pero O2 devolvio la raiz vacia.";
@@ -1305,6 +1421,21 @@ public sealed class MainForm : Form
         if (message.StartsWith("mount:ok ", StringComparison.OrdinalIgnoreCase))
         {
             return $"Montaje: unidad {message["mount:ok ".Length..]} activa.";
+        }
+
+        if (message.StartsWith("mount:auto:ok-empty-root ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Auto-montaje: unidad {message["mount:auto:ok-empty-root ".Length..]} creada, pero O2 devolvio la raiz vacia.";
+        }
+
+        if (message.StartsWith("mount:auto:ok ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Auto-montaje: unidad {message["mount:auto:ok ".Length..]} activa.";
+        }
+
+        if (message.StartsWith("mount:auto:failed ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Auto-montaje fallido ({message["mount:auto:failed ".Length..]}). La aplicación sigue abierta; puedes reintentar con Montar unidad.";
         }
 
         if (message.StartsWith("mount:unmount:start ", StringComparison.OrdinalIgnoreCase))
@@ -1334,8 +1465,20 @@ public sealed class MainForm : Form
             "update:current" => "Actualizacion: la version instalada esta al dia.",
             "auth:stored-session" => "Sesion guardada encontrada; se validara antes de montar.",
             "auth:stored-session:checking" => "Sesion guardada encontrada; validando contra O2 Cloud.",
+            "auth:stored-session:retrying" => "O2 aun no responde; se conserva la sesion y se reintentara la validacion.",
             "auth:stored-session:ok" => "Sesion guardada validada contra O2 Cloud.",
             "auth:stored-session:expired" => "Sesion guardada caducada o rechazada por O2 Cloud; haz Login nuevo.",
+            "auth:stored-session:unavailable" => "No se pudo validar la sesion por ahora. Se conserva; comprueba la red y vuelve a intentarlo.",
+            "auth:stored-session:missing" => "No hay una sesion guardada; puedes iniciar Login manualmente.",
+            "auth:stored-session:Unauthorized401" => "O2 rechazo la sesion (HTTP 401); se conserva para diagnostico y no se montara O:.",
+            "auth:stored-session:Forbidden403" => "O2 denego la sesion (HTTP 403); se conserva para diagnostico y no se montara O:.",
+            "auth:stored-session:MissingValidationKey" => "La sesion guardada no contiene validation key; se conserva y no se montara O:.",
+            "auth:stored-session:MissingDeviceId" => "La sesion guardada no contiene DeviceId; se conserva y no se montara O:.",
+            "auth:stored-session:TransientNetworkFailure" => "Fallo transitorio de red al validar la sesion; se conserva y no se montara O:.",
+            "auth:stored-session:Timeout" => "Tiempo de espera agotado al validar la sesion; se conserva y no se montara O:.",
+            "auth:stored-session:UnexpectedHttpStatus" => "O2 devolvio un status HTTP inesperado; se conserva la sesion y no se montara O:.",
+            "auth:stored-session:InvalidResponse" => "O2 devolvio una respuesta no valida para confirmar la sesion; se conserva y no se montara O:.",
+            "auth:stored-session:OtherFailure" => "No se pudo clasificar la validacion de la sesion; se conserva y no se montara O:.",
             "auth:login:start" => "Login: abriendo navegador integrado; se conserva el estado web para que el SMS de O2 no se reinicie entre intentos.",
             "auth:login:ok" => "Login: sesion validada contra O2 Cloud.",
             "auth:logout:start" => "Logout: desmontando si hace y borrando la sesion local.",

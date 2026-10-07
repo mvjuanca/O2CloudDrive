@@ -4,6 +4,7 @@ using O2CloudDrive;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
 using O2CloudDrive.Shell;
+using O2CloudDrive.Startup;
 using O2CloudDrive.Ui;
 using O2CloudDrive.VirtualFileSystem;
 
@@ -37,6 +38,12 @@ internal static class Program
         if (ShouldRunCommandLine(config, args))
         {
             return RunCommandLine(config);
+        }
+
+        using var singleInstance = SingleInstanceGuard.TryAcquire();
+        if (singleInstance is null)
+        {
+            return 0;
         }
 
         Application.EnableVisualStyles();

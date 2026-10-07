@@ -16,6 +16,7 @@ public sealed class O2LoginForm : Form
     private readonly O2SessionValidator _validator;
     private readonly string? _userDataFolder;
     private readonly Action<string>? _diagnosticLog;
+    private readonly AuthSessionLog? _authSessionLog;
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly Label _statusLabel = new()
     {
@@ -27,17 +28,25 @@ public sealed class O2LoginForm : Form
     private readonly System.Windows.Forms.Timer _captureTimer = new() { Interval = 2000 };
     private readonly HashSet<string> _seenUrls = new(StringComparer.OrdinalIgnoreCase);
     private bool _capturing;
+    private bool _cookieMetadataLogged;
     private bool _webLoginAdvanceInFlight;
     private bool _webLoginAdvanceStarted;
     private string? _lastValidationKey;
     private string? _lastDeviceId;
+    private IReadOnlyCollection<WebViewCookieMetadata> _lastCookieMetadata = Array.Empty<WebViewCookieMetadata>();
 
-    public O2LoginForm(Uri loginUri, O2SessionValidator validator, string? userDataFolder = null, Action<string>? diagnosticLog = null)
+    public O2LoginForm(
+        Uri loginUri,
+        O2SessionValidator validator,
+        string? userDataFolder = null,
+        Action<string>? diagnosticLog = null,
+        AuthSessionLog? authSessionLog = null)
     {
         _loginUri = loginUri;
         _validator = validator;
         _userDataFolder = userDataFolder;
         _diagnosticLog = diagnosticLog;
+        _authSessionLog = authSessionLog;
 
         Text = "O2 Cloud - Login";
         Width = 1100;
@@ -96,7 +105,9 @@ public sealed class O2LoginForm : Form
         try
         {
             var userDataFolder = _userDataFolder ?? O2WebViewProfile.UserDataFolder;
+            var profileExisted = Directory.Exists(userDataFolder);
             Directory.CreateDirectory(userDataFolder);
+            _authSessionLog?.LogWebViewProfileState(userDataFolder, profileExisted);
 
             var environmentOptions = new CoreWebView2EnvironmentOptions
             {
@@ -352,8 +363,14 @@ public sealed class O2LoginForm : Form
             }
 
             _statusLabel.Text = "Sesion detectada. Validando con O2 Cloud...";
-            var valid = await Task.Run(() => _validator.Validate(session));
-            if (!valid)
+            if (!_cookieMetadataLogged)
+            {
+                _authSessionLog?.LogWebViewCookieMetadata(_lastCookieMetadata, session.Cookies.Count);
+                _cookieMetadataLogged = true;
+            }
+
+            var validation = await Task.Run(() => _validator.ValidateDetailed(session));
+            if (validation.Classification != SessionValidationClassification.Accepted)
             {
                 _statusLabel.Text = "Sesion detectada, esperando a que O2 termine de validarla...";
                 return;
@@ -415,6 +432,7 @@ public sealed class O2LoginForm : Form
     private async Task<Dictionary<string, string>> ReadCookiesAsync(string? documentCookie)
     {
         var cookies = ParseCookieHeader(documentCookie);
+        var metadata = new List<WebViewCookieMetadata>();
         var webViewCookies = await _webView.CoreWebView2.CookieManager.GetCookiesAsync("https://cloud.o2online.es/");
         foreach (var cookie in webViewCookies)
         {
@@ -423,12 +441,37 @@ public sealed class O2LoginForm : Form
                 continue;
             }
 
-            if (!string.IsNullOrWhiteSpace(cookie.Name) && !string.IsNullOrWhiteSpace(cookie.Value))
+            if (!string.IsNullOrWhiteSpace(cookie.Name))
             {
-                cookies[cookie.Name] = cookie.Value;
+                DateTimeOffset? expiresUtc = null;
+                if (!cookie.IsSession && cookie.Expires != DateTime.MinValue)
+                {
+                    var expires = cookie.Expires.Kind switch
+                    {
+                        DateTimeKind.Utc => cookie.Expires,
+                        DateTimeKind.Local => cookie.Expires.ToUniversalTime(),
+                        _ => DateTime.SpecifyKind(cookie.Expires, DateTimeKind.Utc),
+                    };
+                    expiresUtc = new DateTimeOffset(expires);
+                }
+
+                metadata.Add(new WebViewCookieMetadata(
+                    cookie.Name,
+                    cookie.Domain,
+                    cookie.Path,
+                    cookie.IsHttpOnly,
+                    cookie.IsSecure,
+                    cookie.IsSession,
+                    expiresUtc));
+
+                if (!string.IsNullOrWhiteSpace(cookie.Value))
+                {
+                    cookies[cookie.Name] = cookie.Value;
+                }
             }
         }
 
+        _lastCookieMetadata = metadata;
         return cookies;
     }
 

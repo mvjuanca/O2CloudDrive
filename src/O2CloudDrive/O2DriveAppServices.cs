@@ -45,13 +45,15 @@ public sealed class O2DriveAppServices : IDisposable
             ConnectTimeout = TimeSpan.FromSeconds(30),
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
         };
-        var httpClient = new HttpClient(handler)
+        var authSessionLog = new AuthSessionLog();
+        var diagnosticsHandler = new AuthSessionDiagnosticsHandler(handler, authSessionLog);
+        var httpClient = new HttpClient(diagnosticsHandler)
         {
             Timeout = Timeout.InfiniteTimeSpan,
         };
-        var sessionValidator = new O2SessionValidator(httpClient, config.ApiBaseUrl);
+        var sessionValidator = new O2SessionValidator(httpClient, config.ApiBaseUrl, authSessionLog);
         var sessionStore = new WindowsCredentialSessionStore(config.CredentialTarget);
-        var loginService = new WebViewInteractiveLoginService(config.LoginUrl);
+        var loginService = new WebViewInteractiveLoginService(config.LoginUrl, authSessionLog);
         var authService = new AuthService(sessionStore, loginService, sessionValidator);
         var apiClient = new O2CloudApiClient(httpClient, authService, config.ApiBaseUrl);
         var readCacheOptions = new ReadCacheOptions(
